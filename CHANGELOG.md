@@ -8,4 +8,5 @@
 - CLI entry point with automatic device selection (CUDA / MPS / CPU) (`__main__.py`)
 - Public API surface: `Qwen3Model`, `QWEN3_0_6B_CONFIG`, `generate` (`__init__.py`)
 - Test suite comparing logits argmax and 20-token greedy generation against HuggingFace `transformers` (eager attention)
-- Tutorial: `tutorials/01-naive-inference.md` — full walkthrough of the implementation
+- Benchmark harness (`benchmark.py`): prefill/decode TPS, TTFT, peak memory, per-token latency (p50/p90/p99), JSON output; preset aliases `xs` / `short` / `medium` / `long`
+- Tutorial: `tutorials/01-generation.md` — full walkthrough of the implementation with baseline benchmark results on Apple M3 Pro CPU
