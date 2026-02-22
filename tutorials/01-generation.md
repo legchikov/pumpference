@@ -2,21 +2,6 @@
 
 *Pumpference series — from zero to a running language model in plain PyTorch*
 
----
-
-Somewhere around hour 16 of this project, deep into a debugging session that should have taken 30 minutes, I found the bug. Everything in my implementation looked right. The architecture matched the paper. The weight loading looked correct. The model generated text. But the logits were off by a small, consistent margin — just enough to fail the comparison test.
-
-I had checked RMSNorm twice. I had re-read the RoPE math. I had gone through the weight-loading function line by line three times. I had added print statements everywhere. Nothing obviously wrong.
-
-The bug was two words: `attn_implementation="eager"`. By default, HuggingFace uses a fused attention kernel that produces slightly different numerical results than explicit matrix operations. My implementation was perfectly correct. My *test* was comparing it against the wrong thing.
-
-I fixed it in 30 seconds. I found it in 4 hours.
-
-This is what building LLM inference from scratch actually feels like. Not a smooth progression from diagram to working code. Just a long series of small collisions with reality, each one making the system slightly more legible. This article documents all of them.
-
----
-
-## Why bother?
 
 HuggingFace `transformers` handles all of this. `vLLM` does it faster. `llama.cpp` runs it on your phone. So why build from scratch?
 
@@ -54,7 +39,7 @@ The numbers from `config.json`:
 
 One thing I appreciated: Qwen3-0.6B has a single `model.safetensors` file. No sharding, no complicated weight merging. Just one file.
 
-My primary reference was Sebastian Raschka's [from-scratch Qwen3 walkthrough](https://sebastianraschka.com/blog/2025/qwen3-from-scratch.html). Highly recommended alongside this one — his approach and mine differ in places, and the differences are instructive.
+My primary reference Qwen3 was Sebastian Raschka's [from-scratch Qwen3 walkthrough](https://sebastianraschka.com/blog/2025/qwen3-from-scratch.html). 
 
 ---
 
@@ -499,7 +484,7 @@ One more thing: the EOS token for Qwen3 is `<|im_end|>`, not `<|endoftext|>`. Qw
 
 ## The generation loop
 
-Here's the complete autoregressive generation loop:
+This is the part the tutorial has been building toward. Everything we've implemented — RMSNorm, RoPE, SwiGLU, GQA, weight loading — exists to support these 12 lines of Python:
 
 ```python
 @torch.no_grad()
@@ -518,13 +503,81 @@ def generate(model, input_ids, max_new_tokens, eos_token_id=None):
     return tokens
 ```
 
-That's it. That's the whole thing.
+Let me walk through what's actually happening here, because there's more to unpack than the brevity suggests.
 
-On every step: full forward pass over the entire sequence, look at only the last position's logits, pick the highest-probability token, append it to the sequence, repeat.
+### The model is a next-token predictor
 
-This is "naive" in a precise computational sense. On step 100, we're recomputing keys and values for positions 1 through 99 even though they haven't changed. Every additional token in context makes every future step proportionally more expensive. This is O(n²) — and we'll see exactly how bad that is in the benchmarks section.
+The fundamental thing the model computes is: *given this sequence of tokens, what token is most likely to come next?*
 
-`argmax` always picks the single most probable token. Deterministic, correct, produces reasonable output for factual queries. But it has a failure mode: it always picks the most "expected" continuation. For open-ended generation, this tends toward safe, repetitive output. We address this in Tutorial 2 with sampling.
+More precisely, `model(tokens)` takes a tensor of shape `[1, seq_len]` and returns logits of shape `[1, seq_len, vocab_size]` — a vector of 151,936 raw scores for every position in the sequence. These aren't probabilities yet; they're pre-softmax scores. Apply softmax and you get a probability distribution over the vocabulary at each position.
+
+Why does it return logits for *every* position, not just the last one? Because during training, the model is trained with teacher forcing — it sees the full input sequence and is asked to predict the next token at every single position simultaneously. This is what makes transformer training efficient: one forward pass, `seq_len` training signals. At inference time we only care about position -1, but the architecture naturally produces all positions.
+
+So the key line is:
+
+```python
+next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
+```
+
+`logits[:, -1]` extracts the logit vector at the last sequence position — shape `[1, vocab_size]`. That vector encodes the model's beliefs about what token comes after everything it just read. `argmax` picks the token with the highest score. That token becomes the next word.
+
+### Autoregression: the output feeds back as input
+
+The reason this is called *autoregressive* generation is in this line:
+
+```python
+tokens = torch.cat([tokens, next_token], dim=1)
+```
+
+We take the token we just sampled and append it to the sequence. The sequence grows by one token. On the next iteration, `model(tokens)` sees that longer sequence — both the original prompt and everything the model has generated so far — and produces a new distribution at the new last position. We sample again. Append again. Repeat.
+
+Let's trace through a concrete example. Say the prompt is "The capital of France is" — call it tokens `[1, 791, 6864, 315, 9625, 374]` (6 tokens). On step 0:
+
+```
+Input:  [1, 791, 6864, 315, 9625, 374]         # 6 tokens
+Output: logits of shape [1, 6, 151936]
+        logits[:, -1] → distribution over vocab at position 5
+        argmax → token 13573 ("Paris")
+```
+
+We append `13573`, making the sequence `[1, 791, 6864, 315, 9625, 374, 13573]`. On step 1:
+
+```
+Input:  [1, 791, 6864, 315, 9625, 374, 13573]  # 7 tokens
+Output: logits of shape [1, 7, 151936]
+        logits[:, -1] → distribution at position 6
+        argmax → token 13 (".")
+```
+
+And so on, until we hit `max_new_tokens` or the EOS token. The sequence grows by exactly one token per step. Each step conditions on the full history. That's autoregression.
+
+### What "greedy" means
+
+`argmax` is greedy decoding: at every step, pick the single most probable next token. It's called greedy because it's locally optimal — it takes the best available choice right now — but not globally optimal. The most probable token at step 1 might lead to a context where no good tokens exist at step 5. Human language doesn't always follow the path of maximum immediate probability.
+
+Greedy decoding is also entirely deterministic. Same prompt, same model, same output, always. No randomness whatsoever.
+
+That determinism is a feature for benchmarking and testing — reproducibility is free. It's a limitation for creative generation — the model always tells the most average version of any story. Tutorial 2 adds temperature, top-k, and top-p sampling to trade some determinism for diversity.
+
+### The O(n²) cost — in concrete numbers
+
+Here's the uncomfortable reality about this implementation.
+
+On decode step $k$, the input to the model has length $n_0 + k$, where $n_0$ is the prompt length. The model runs a full forward pass over the entire sequence. The attention computation — for a sequence of length $L$ — does $O(L^2)$ work: every position attends to every past position.
+
+So on the `long` preset (372-token prompt, 100 tokens generated):
+- Step 1: forward pass over 373 tokens
+- Step 2: forward pass over 374 tokens
+- Step 50: forward pass over 422 tokens
+- Step 100: forward pass over 472 tokens
+
+Total compute across all 100 decode steps is proportional to $\sum_{k=1}^{100} (372 + k)^2$. Each step is slower than the one before it because the sequence is longer.
+
+This is why the benchmark numbers look the way they do — 0.6 tok/s at 115 tokens but only 0.2 tok/s at 372 tokens. The decode step itself is getting more expensive on every iteration because we're re-computing keys and values for positions we've already seen.
+
+The standard fix is a **KV-cache**: store the key and value tensors computed during prefill, and on each decode step, only compute the new token's query against the cached keys and values. Instead of reprocessing all $n_0 + k$ tokens, you process exactly 1 new token. Decode goes from O(n) work per step to O(1) — and the throughput numbers become independent of context length. That's Tutorial 4.
+
+For now, we accept the O(n²) cost and appreciate the clarity. The implementation is correct. It's just slow in a well-understood way.
 
 ---
 
@@ -551,7 +604,7 @@ Why compare argmax rather than exact logit values? Because bfloat16 arithmetic i
 
 We also run a generation comparison: 20-token greedy generation, token-by-token equality. Both tests together cover single-forward accuracy and sequential accumulation.
 
-**The hidden bug that opened this article.** Loading the HuggingFace model for comparison requires:
+**The hidden bug.** Loading the HuggingFace model for comparison requires:
 
 ```python
 hf_model = AutoModelForCausalLM.from_pretrained(
