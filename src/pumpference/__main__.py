@@ -36,6 +36,24 @@ def main() -> None:
         default="auto",
         help="Device to run inference on (default: auto-detect)",
     )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature (0.0 = greedy argmax, default: 0.0)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=0,
+        help="Top-k filtering: keep only the k most likely tokens (0 = disabled, default: 0)",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Nucleus sampling threshold: cumulative probability cutoff (1.0 = disabled, default: 1.0)",
+    )
     args = parser.parse_args()
 
     # --- Device -----------------------------------------------------------
@@ -74,6 +92,9 @@ def main() -> None:
         input_tensor,
         max_new_tokens=args.max_tokens,
         eos_token_id=tokenizer.eos_token_id,
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
     )
 
     new_ids = output_ids[0, len(input_ids) :].tolist()

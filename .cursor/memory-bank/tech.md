@@ -76,7 +76,7 @@ uv run pytest          # run tests (downloads ~1.2GB model on first run)
 - No GPU required — runs on CPU (also supports CUDA and MPS)
 - bfloat16 precision throughout (matches HF distribution)
 - Current generation is O(n²) per token (no KV-cache yet)
-- Greedy decoding only (no sampling parameters yet)
+- Sampling decoding: temperature, top-k, top-p (nucleus) — all composable; temperature=0 falls back to greedy
 - Single-sequence inference only (batch size = 1)
 
 ## Testing strategy
@@ -85,3 +85,4 @@ uv run pytest          # run tests (downloads ~1.2GB model on first run)
 - HF model must use `attn_implementation="eager"` for fair comparison
 - Module-scoped fixtures avoid re-downloading/loading model per test
 - Tests verify: logits argmax equality, max logit diff < 1.0, greedy generation token equality
+- `tests/test_sampling.py`: 17 unit tests for sampling strategies (no model load required)

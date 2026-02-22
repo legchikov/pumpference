@@ -27,7 +27,20 @@ The **benchmark harness is complete**. The naive inference is verified correct a
 
 ## Current work focus
 
-No active feature development. Tutorial 1 complete with baseline numbers.
+Sampling decoding is complete. Tutorial 2 written.
+
+## What has been added (sampling)
+
+- `sample_next_token(logits, temperature, top_k, top_p)` function in `generate.py`
+  - `temperature=0` → greedy argmax (backward-compatible default)
+  - top-k: masks all but the k highest-logit tokens before sampling
+  - top-p (nucleus): cumulative-probability threshold with shift-right logic; always keeps position 0
+  - Final softmax in float32; `torch.multinomial` for stochastic draw
+- `generate()` updated to accept and pass through `temperature`, `top_k`, `top_p`
+- CLI (`__main__.py`) exposes `--temperature`, `--top-k`, `--top-p` flags
+- `sample_next_token` exported from `__init__.py`
+- 17 unit tests in `tests/test_sampling.py` (no model load required): greedy equivalence, reproducibility, top-k/top-p correctness, composability, output shape
+- Tutorial 2 written: `tutorials/02-sampling.md`
 
 ## Tutorial format decision
 
@@ -36,8 +49,7 @@ Tutorials 2+ are **dev-log articles**, not step-by-step code walkthroughs. Code 
 ## Next steps (from roadmap)
 
 1. **KV-cache**: make generation O(n) instead of O(n²) — biggest single speedup
-2. **Sampling parameters**: temperature, top-k, top-p (nucleus) sampling
-3. Profiling and optimization deep-dive
+2. Profiling and optimization deep-dive
 
 ## Known issues
 

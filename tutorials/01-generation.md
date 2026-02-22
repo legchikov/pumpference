@@ -1,41 +1,40 @@
-# Tutorial 1: Let's Build LLM Inference From Scratch
+# Part 1: Building an LLM Inference Engine From Scratch
 
-*Pumpference series — from zero to a working inference framework in plain PyTorch*
+*Pumpference series — from zero to a running language model in plain PyTorch*
 
 ---
 
-There's a moment during this project that I keep thinking about. You've been staring at matrix shapes for days. You've debugged RoPE conventions and weight name mappings and bfloat16 precision traps. And then you type a prompt, hit enter, and your from-scratch implementation — your code, talking directly to the weight tensors — prints a coherent English sentence.
+Somewhere around hour 16 of this project, deep into a debugging session that should have taken 30 minutes, I found the bug. Everything in my implementation looked right. The architecture matched the paper. The weight loading looked correct. The model generated text. But the logits were off by a small, consistent margin — just enough to fail the comparison test.
 
-No `transformers`. No magic. Just PyTorch matmuls all the way down.
+I had checked RMSNorm twice. I had re-read the RoPE math. I had gone through the weight-loading function line by line three times. I had added print statements everywhere. Nothing obviously wrong.
 
-That moment is what this tutorial is about. We're going to build a complete LLM inference engine from scratch. By the end, you'll understand *every single operation* that happens between a text prompt and the first generated word. Not at a "I've read the diagram" level — at a "I wrote this code and debugged why line 147 produces NaN" level.
+The bug was two words: `attn_implementation="eager"`. By default, HuggingFace uses a fused attention kernel that produces slightly different numerical results than explicit matrix operations. My implementation was perfectly correct. My *test* was comparing it against the wrong thing.
 
-The implementation is in `src/pumpference/` on main. This article explains the why and the how. Let's get into it.
+I fixed it in 30 seconds. I found it in 4 hours.
+
+This is what building LLM inference from scratch actually feels like. Not a smooth progression from diagram to working code. Just a long series of small collisions with reality, each one making the system slightly more legible. This article documents all of them.
 
 ---
 
 ## Why bother?
 
-HuggingFace `transformers` is incredible. `vLLM` is incredible. `llama.cpp` is incredible. They're also enormous. When you call `model.generate()`, somewhere between 50 and several thousand things happen invisibly: KV-cache management, attention masking, tokenization, sampling, quantization, kernel dispatch. When something goes wrong — or when you want to add something new — you're lost in a labyrinth of abstractions.
+HuggingFace `transformers` handles all of this. `vLLM` does it faster. `llama.cpp` runs it on your phone. So why build from scratch?
 
-Building from scratch forces you to answer questions that production frameworks never make explicit:
+Because every time you use a black box, you're trading understanding for convenience. For LLMs specifically, the black box is unusually opaque. When you call `model.generate()`, somewhere between 50 and several thousand things happen invisibly: KV-cache management, attention masking, tokenization, sampling, quantization, kernel dispatch. You get text out. You have no idea what decisions were made on the way.
 
-- What *exact shape* is the attention mask, and why?
-- Why does normalization need to upcast to float32?
-- What happens when the number of KV heads doesn't match the number of Q heads?
-- How do pretrained weight names (which are someone else's naming convention) map to your architecture?
+Building from scratch forces a different relationship. You can't have a wrong mental model about something you wrote every line of. The questions that production frameworks never make explicit — what exact shape is the attention mask, why does normalization upcast to float32, what happens when KV heads don't match Q heads — have to be answered, because your code won't run until you answer them.
 
-I want to be clear about what this is not. This is not a performance-engineering exercise. The implementation we build here is intentionally naive — no KV-cache, no batching, no quantization. It re-computes everything from scratch on every forward pass. That's the point. Clarity first, speed later.
+I want to be precise about what this is not. This is not a performance project. The implementation here is intentionally naive: no KV-cache, no batching, no quantization, no clever kernels. It recomputes everything from scratch on every forward pass. That's the point. Clarity first. Speed later (Tutorial 4).
 
 ---
 
 ## Choosing a model
 
-The first question is: which model? We need something small enough to run on a MacBook CPU (roughly 1-2 GB of weights), modern enough to have all the techniques worth learning, and well-documented enough that we can verify our work.
+I needed something small enough to run on a MacBook CPU — under 2 GB of weights — modern enough to include all the architectural ideas worth learning, and simple enough that I could verify correctness against a reference.
 
-Qwen3-0.6B is essentially perfect for this. It's ~1.2 GB in bfloat16, it fits in RAM on any modern laptop, and it uses every important modern LLM architectural idea: RMSNorm, Rotary Positional Embeddings (RoPE), SwiGLU feed-forward networks, Grouped-Query Attention, and QK normalization. If you understand the Qwen3-0.6B architecture, you understand the vast majority of what's happening inside LLaMA, Mistral, Gemma, and their relatives. Sebastian Raschka's [from-scratch Qwen3 walkthrough](https://sebastianraschka.com/blog/2025/qwen3-from-scratch.html) was my primary reference baseline.
+Qwen3-0.6B is close to perfect. It's ~1.2 GB in bfloat16. It runs on any modern laptop with 8+ GB of RAM. And it uses every important technique in modern decoder-only transformers: RMSNorm, Rotary Positional Embeddings, SwiGLU feed-forward networks, Grouped-Query Attention, QK normalization. If you understand this model's internals, you understand roughly 90% of what's happening inside LLaMA 3, Mistral, Gemma, and their relatives. The architecture family has substantially converged on these components.
 
-Here are the numbers from the model's `config.json`:
+The numbers from `config.json`:
 
 | Parameter | Value |
 |---|---|
@@ -53,13 +52,17 @@ Here are the numbers from the model's `config.json`:
 | QK normalization | Yes |
 | Weight tying | Yes |
 
-One more thing I appreciated: Qwen3-0.6B has a single `model.safetensors` file. No sharding, no complicated weight merging. Just one file.
+One thing I appreciated: Qwen3-0.6B has a single `model.safetensors` file. No sharding, no complicated weight merging. Just one file.
+
+My primary reference was Sebastian Raschka's [from-scratch Qwen3 walkthrough](https://sebastianraschka.com/blog/2025/qwen3-from-scratch.html). Highly recommended alongside this one — his approach and mine differ in places, and the differences are instructive.
 
 ---
 
 ## Setup
 
-I use [`uv`](https://docs.astral.sh/uv/) for package management. It's fast, handles virtual environments correctly, and locks dependencies properly. The project is a proper Python package with a `src/` layout:
+I'm using [`uv`](https://docs.astral.sh/uv/) for package management. Fast, correct virtual environment handling, real lockfiles.
+
+The dependency split matters:
 
 ```toml
 [project]
@@ -79,7 +82,7 @@ dev = [
 ]
 ```
 
-Notice the dependency split. The runtime stack is minimal: PyTorch, safetensors for loading weights, `huggingface_hub` for downloading them, and `tokenizers` (the lightweight HuggingFace library, not `transformers`) for BPE encoding. HuggingFace `transformers` is a dev dependency only — used exclusively in tests to verify our implementation is correct. At runtime, we never touch it.
+The runtime stack is minimal: PyTorch, `safetensors` for loading weights, `huggingface_hub` for downloading them, and `tokenizers` — the lightweight HuggingFace library, not `transformers` — for BPE encoding. HuggingFace `transformers` is dev-only, used exclusively in tests to verify our implementation is correct. At runtime we never touch it.
 
 The directory structure:
 
@@ -87,19 +90,19 @@ The directory structure:
 pumpference/
 ├── src/pumpference/
 │   ├── model.py      # All architecture + weight loading (~340 lines)
-│   ├── generate.py   # Greedy generation loop (~40 lines)
+│   ├── generate.py   # Generation loop (~60 lines)
 │   └── tokenizer.py  # Tokenizer wrapper (~80 lines)
 └── tests/
     └── test_model.py # Comparison tests vs HuggingFace
 ```
 
-One design decision worth flagging up front: I initially split the model into many small files — `config.py`, `attention.py`, `rope.py`, `weights.py`, inside a `qwen3/` subpackage. I later consolidated everything into a single `model.py`. Why? At ~340 lines, the whole model fits in one file without losing readability, and having everything in one place makes it dramatically easier to follow the data flow. Premature modularization is a real antipattern in educational code.
+One design decision I want to flag: I initially split the model into many files — `config.py`, `attention.py`, `rope.py`, `weights.py`, inside a `qwen3/` subpackage. I later merged everything into a single `model.py`. The model is ~340 lines. Having everything in one place makes it dramatically easier to trace the data flow. Premature modularization is a real antipattern in educational code — you get the complexity of multiple files without any of the benefits that justify having them.
 
 ---
 
-## The architecture at a glance
+## Architecture overview
 
-Before we write any code, let's look at what we're building:
+Before writing any code, here's the full picture of what we're building:
 
 ```
 input_ids [batch, seq_len]
@@ -110,11 +113,11 @@ Token Embedding          # vocab_size → emb_dim (1024)
     ▼
 TransformerBlock × 28
   ├─ RMSNorm
-  ├─ GroupedQueryAttention   ─┐
-  ├─ + residual               │
-  ├─ RMSNorm                  │ repeated 28 times
-  ├─ FeedForward (SwiGLU)  ─┐ │
-  └─ + residual              │ │
+  ├─ GroupedQueryAttention   # 16 Q-heads, 8 KV-heads
+  ├─ + residual
+  ├─ RMSNorm
+  ├─ FeedForward (SwiGLU)
+  └─ + residual
     │
     ▼
 Final RMSNorm
@@ -126,13 +129,13 @@ Linear Head              # emb_dim → vocab_size (151,936)
 logits [batch, seq_len, 151936]
 ```
 
-Every decoder-only transformer — GPT-2, LLaMA, Qwen, Mistral — follows this structure. The differences between models live in the *details* of each block. Let's build each one.
+Every decoder-only transformer — GPT-2, LLaMA, Qwen, Mistral — follows this exact structure. The differences between models live in the *details* of each block, not in the overall shape. Let's build each piece.
 
 ---
 
 ## The config
 
-Every architecture constant — embedding dimension, number of heads, layer count — needs to come from somewhere. I use a Python dataclass:
+Every architecture constant needs to come from somewhere. A Python dataclass is the cleanest option:
 
 ```python
 @dataclass
@@ -151,23 +154,25 @@ class Qwen3Config:
     dtype: torch.dtype = field(default=torch.bfloat16)
 ```
 
-All values come from the model's `config.json` on HuggingFace. The mapping isn't always obvious — HuggingFace calls the embedding dimension `hidden_size` (1024) and the FFN width `intermediate_size` (3072). Their naming is confusing because in most ML literature "hidden size" means the FFN's internal width. I renamed them `emb_dim` and `hidden_dim` to be less ambiguous.
+All values come from `config.json` on HuggingFace. The naming translation isn't always obvious — HuggingFace calls the embedding dimension `hidden_size` (1024) and the FFN width `intermediate_size` (3072). Their naming is confusing because in most ML literature "hidden" means the FFN's internal width, not the main model dimension. I renamed them `emb_dim` and `hidden_dim` to be less ambiguous.
 
-Why bfloat16? The weights are distributed in bfloat16. Using the same dtype avoids precision loss from casting and keeps memory identical to the original. bfloat16 has the same exponent range as float32 (so no overflow) but 8 bits of mantissa instead of 24 — plenty for inference.
+bfloat16 throughout: same exponent range as float32 (no overflow), 8 bits of mantissa instead of 24. Plenty for inference. Matching the distribution dtype avoids casting overhead and keeps everything numerically consistent with the original.
 
 ---
 
 ## RMSNorm
 
-Ok, the simplest building block first. Modern transformers normalize activations between sub-layers — this stabilizes training and prevents values from exploding or vanishing as they pass through 28 layers. RMSNorm (Root Mean Square Normalization) is the normalization used in Qwen3, LLaMA, Mistral, and most modern models.
+Let's start with the simplest component.
 
-The idea is simple: normalize each vector by its root mean square, then scale by a learned parameter. The formula:
+Modern transformers normalize activations between sub-layers to prevent values from growing or vanishing as they pass through 28 layers. RMSNorm (Root Mean Square Normalization) is the choice in Qwen3, LLaMA, Mistral, and most current models.
+
+The formula:
 
 $$\text{RMSNorm}(x) = \frac{x}{\sqrt{\frac{1}{d}\sum_i x_i^2 + \epsilon}} \cdot \gamma$$
 
-Compare this to LayerNorm, which also subtracts the mean before normalizing. RMSNorm skips that step entirely. Empirically, the re-centering doesn't help, and removing it makes the computation ~10-15% faster. Fewer parameters too — no bias term.
+Compare to LayerNorm: LayerNorm subtracts the mean before normalizing; RMSNorm skips that step entirely. The argument is that re-centering doesn't help at scale — the network can work around any constant offset through its weights. RMSNorm is ~10–15% faster and has fewer parameters. Fewer moving parts.
 
-The code is almost trivially short:
+The code is almost embarrassingly short:
 
 ```python
 class RMSNorm(nn.Module):
@@ -184,19 +189,19 @@ class RMSNorm(nn.Module):
         return (x * self.scale).to(original_dtype)
 ```
 
-There's one thing in here that isn't obvious: the `x.to(torch.float32)` upcast. This was my first subtle bug. If you compute the variance in bfloat16, you lose precision — squaring and averaging small values accumulates rounding error. The model will still *run*, but its logits will diverge from the reference implementation. The fix is to upcast to float32 for the RMS computation, then cast back. Two lines. Hours of confusion before I found it.
+One thing in here that's not obvious: `x.to(torch.float32)`. This was my first precision bug. If you compute variance in bfloat16, you lose precision — squaring small values and averaging them accumulates rounding error. The model runs, the outputs look reasonable, but the logits diverge from the reference by just enough to fail the test. The fix is to upcast to float32 for the computation, then cast back to bfloat16 before returning. Two lines. An embarrassingly long time to find.
 
 ---
 
 ## Rotary Positional Embeddings (RoPE)
 
-Here's the fundamental problem: a transformer processes all positions in parallel, with no built-in sense of order. Position 1 and position 100 look the same to the model unless we explicitly encode position information somewhere.
+A transformer processes all positions in parallel. Without explicit position information, the token at position 1 and the token at position 100 look identical to the model — same input representation, same operations, same output. We need to encode position somewhere.
 
-The classic solution (used in original GPT models) is to add positional embeddings to the token embeddings. RoPE takes a different approach: instead of adding position information to the input, it *rotates* the query and key vectors in attention. The rotation angle depends on the position, so tokens far apart in the sequence will have their Q and K vectors rotated by different amounts — making their dot products naturally depend on their relative distance.
+The classic approach adds a position-dependent vector to each token embedding before the transformer layers. RoPE takes a more elegant approach: instead of adding position information to the input, it *rotates* the query and key vectors in each attention head. The rotation angle depends on position and dimension index — tokens far apart in the sequence have their Q and K vectors rotated by different amounts, so their dot product naturally encodes relative distance.
 
-The math: for each pair of dimensions $(2i, 2i+1)$ in a head vector, we apply a 2D rotation by angle $\theta_i \cdot m$, where $m$ is the token position and $\theta_i = \text{base}^{-2i/d}$. The frequencies decrease geometrically with dimension index, so different dimensions encode position at different scales — a bit like how clocks use seconds, minutes, and hours.
+The math: for each pair of dimensions $(2i, 2i+1)$ in a head vector, apply a 2D rotation by angle $\theta_i \cdot m$, where $m$ is the token position and $\theta_i = \text{base}^{-2i/d}$. The frequencies decrease geometrically with dimension index — the first few dimensions change rapidly with position, the last few change slowly. It's a little like how a clock represents time with three hands at very different speeds.
 
-We pre-compute the cos and sin tables once, for all positions up to the context length:
+We precompute the cos and sin tables once, for all positions up to the context length:
 
 ```python
 def compute_rope_params(
@@ -207,14 +212,14 @@ def compute_rope_params(
     assert head_dim % 2 == 0
     inv_freq = 1.0 / (
         theta_base ** (torch.arange(0, head_dim, 2).float() / head_dim)
-    )                                                        # [head_dim // 2]
+    )
     positions = torch.arange(context_length).float()
     angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)  # [ctx, head_dim // 2]
     angles = torch.cat([angles, angles], dim=1)              # [ctx, head_dim]
     return torch.cos(angles), torch.sin(angles)
 ```
 
-And applying the rotation is surprisingly clean — we don't need explicit rotation matrices. Split the vector into first and second halves, negate the second half, concatenate them in reverse order, then combine with cos/sin:
+Applying the rotation is clean — split each head vector into two halves, swap with a sign flip, combine with cos/sin:
 
 ```python
 def apply_rope(x, cos, sin):
@@ -227,27 +232,27 @@ def apply_rope(x, cos, sin):
     return ((x * cos) + (rotated * sin)).to(x.dtype)
 ```
 
-Two gotchas worth flagging:
+Two gotchas that cost me meaningful time:
 
-**The theta_base value.** Qwen3 uses `rope_base = 1,000,000` — far higher than the original RoPE paper's 10,000. A higher base stretches the positional wavelengths, enabling the model to generalize to longer sequences. If you use the default 10,000 (which I initially did), the model generates garbage on any sequence longer than a few hundred tokens. And crucially, even short sequences don't match the reference — different theta means different rotations everywhere.
+**The theta base.** Qwen3 uses `rope_base = 1,000,000` — far higher than the original RoPE paper's 10,000. A higher base stretches the positional wavelengths, letting the model generalize better to long sequences. If you use 10,000 — which I initially did, because that's the default in most blog posts about RoPE — the logits don't match the reference even on short sequences. Every attention score is computed with the wrong rotation angle.
 
-**Concat vs interleave.** There are two conventions for how rotation pairs dimensions:
-- *Interleaved*: pairs are $(0,1), (2,3), (4,5)...$ — the original RoPE paper.
-- *Split-half*: pairs are $(0, d/2), (1, d/2+1)...$ — LLaMA, Qwen, and most modern implementations.
+**Interleaved vs split-half pairing.** There are two conventions for how to pair dimensions for rotation:
+- *Interleaved*: pairs are (0,1), (2,3), (4,5)... — the original RoPE paper.
+- *Split-half*: pairs are (0, d/2), (1, d/2+1)... — LLaMA, Qwen, and most modern implementations.
 
-These produce completely different results. Qwen3 uses split-half, which is what `torch.cat([-x2, x1], dim=-1)` implements. If you port code from a different implementation, check which convention it uses.
+These produce completely different results. Qwen3 uses split-half, which is what `torch.cat([-x2, x1], dim=-1)` implements. This has no type error, no shape mismatch, no error message of any kind. It just silently produces wrong rotations. Check which convention your source material uses before porting anything.
 
 ---
 
-## SwiGLU Feed-Forward Network
+## SwiGLU Feed-Forward
 
-Each transformer block has a feed-forward network that applies after attention. The standard design (from "Attention Is All You Need") uses two linear layers: project up → apply nonlinearity → project back down. SwiGLU adds a twist: use three linear layers instead of two.
+Every transformer block has a feed-forward network that runs after attention. The classical design (from "Attention Is All You Need") is two linear layers: project up, apply a nonlinearity, project back down. SwiGLU replaces this with three:
 
 $$\text{FFN}(x) = W_3 \cdot (\text{SiLU}(W_1 \cdot x) \odot W_2 \cdot x)$$
 
-Where $\odot$ is elementwise multiplication. The idea: project to a higher dimension *twice* — one projection passes through a SiLU activation, the other is a "gate" — then multiply them together before projecting back down. The gate learns to suppress or amplify different features before passing them through the nonlinearity.
+You project the input twice, independently. One projection goes through SiLU. The other is a "gate" — it multiplies the activated projection element-wise before projecting back down. The gate learns to suppress or amplify different features. Empirically this outperforms a standard MLP at the same parameter count.
 
-In code it's delightfully concise:
+In code it's unreasonably concise:
 
 ```python
 class FeedForward(nn.Module):
@@ -261,23 +266,21 @@ class FeedForward(nn.Module):
         return self.fc3(nn.functional.silu(self.fc1(x)) * self.fc2(x))
 ```
 
-Yes, `fc1` and `fc2` both take the same input `x`. They're independent projections — neither depends on the other. The gate mechanism (`* self.fc2(x)`) is purely multiplicative gating after the activation.
+`fc1` and `fc2` both take the same input `x`. They're independent projections. The gate mechanism is purely multiplicative after the activation.
 
-One gotcha that bit me: the HuggingFace weight names are `gate_proj`, `up_proj`, `down_proj`. In SwiGLU, `gate_proj` is the branch that goes through SiLU (`fc1` in my naming), and `up_proj` is the gate branch (`fc2`). I had them swapped initially. The model ran fine — matrix multiplications don't complain — but the outputs were nonsense. The test suite caught it immediately, which is why writing tests against a reference implementation is non-negotiable.
+A gotcha worth documenting: HuggingFace weight names are `gate_proj`, `up_proj`, `down_proj`. In SwiGLU, `gate_proj` is the branch that goes through SiLU — that's `fc1` in my naming. `up_proj` is the gate branch — `fc2`. I had them swapped in an early version. The model ran perfectly fine (matrix multiplication is indifferent to which branch has which weights), but the outputs were completely wrong. The test suite caught this immediately. This is exactly the kind of bug that passes visual inspection and needs a comparison test to surface.
 
-Notice also `bias=False` on every linear layer. Modern LLMs (LLaMA, Qwen, Mistral, Gemma) have dropped bias terms across the board. Empirically, biases don't help at scale and removing them simplifies the architecture.
+Also: `bias=False` on every linear layer. Modern LLMs (LLaMA, Qwen, Mistral, Gemma) have universally dropped bias terms. They don't improve training at scale; removing them simplifies the architecture.
 
 ---
 
 ## Grouped-Query Attention
 
-This is the most complex component. Let's build up to it.
+This is the most complex component. Let me build up to it.
 
-Standard multi-head attention projects queries, keys, and values all to the same number of heads. GQA reduces the number of key-value heads while keeping the full count of query heads. Qwen3-0.6B has 16 query heads but only 8 KV heads. Each KV head is shared by 2 query heads.
+Standard multi-head attention projects queries, keys, and values all to the same number of heads. Grouped-Query Attention (GQA) reduces the KV head count while keeping the full Q head count. Qwen3-0.6B has 16 Q heads but only 8 KV heads. Each KV head is shared by 2 Q heads.
 
-Why does this matter? The key-value cache (which we'll implement in a later tutorial) stores the keys and values for every token in the sequence. With 16 full KV heads, the cache is 2× larger than it needs to be. With 8 KV heads, we halve the cache memory while keeping the expressiveness of 16 query heads. At scale, this is a very attractive trade.
-
-For our naive implementation (no KV-cache yet), GQA just means asymmetric projection dimensions:
+Why? Memory. The key-value cache (Tutorial 4) stores key and value tensors for every token in context. With 16 full KV heads, that cache is 2× larger than it needs to be. With 8 KV heads, you halve the KV cache memory at a tiny quality cost — empirically, barely measurable. For our naive implementation without a KV-cache, GQA just means asymmetric projection dimensions:
 
 ```python
 class GroupedQueryAttention(nn.Module):
@@ -301,77 +304,69 @@ class GroupedQueryAttention(nn.Module):
             self.k_norm = RMSNorm(head_dim)
 ```
 
-`W_query` projects to 2048, `W_key` and `W_value` project to 1024. That asymmetry is the whole GQA idea.
+`W_query` projects to 2048 dimensions (16 heads × 128). `W_key` and `W_value` project to 1024 (8 heads × 128). That asymmetry is the entire GQA idea.
 
-The forward pass proceeds in a specific order that matters:
+The forward pass has a specific operation order that matters:
 
 ```python
 def forward(self, x, mask, cos, sin):
     batch, seq_len, _ = x.shape
 
-    # 1. Project → reshape → [batch, heads, seq_len, head_dim]
     queries = self.W_query(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
     keys    = self.W_key(x).view(batch, seq_len, self.num_kv_groups, self.head_dim).transpose(1, 2)
     values  = self.W_value(x).view(batch, seq_len, self.num_kv_groups, self.head_dim).transpose(1, 2)
 
-    # 2. QK normalization (Qwen3-specific — applied AFTER projection, BEFORE RoPE)
+    # QK normalization: Qwen3-specific, applied AFTER projection, BEFORE RoPE
     if self.q_norm:
         queries = self.q_norm(queries)
     if self.k_norm:
         keys = self.k_norm(keys)
 
-    # 3. Apply RoPE to Q and K (NOT to values)
+    # Apply RoPE to Q and K (not to values)
     queries = apply_rope(queries, cos, sin)
     keys    = apply_rope(keys, cos, sin)
 
-    # 4. Expand KV heads to match Q heads (AFTER RoPE, not before)
-    keys   = keys.repeat_interleave(self.group_size, dim=1)    # 8 → 16 heads
+    # Expand KV heads to match Q heads — AFTER RoPE, not before
+    keys   = keys.repeat_interleave(self.group_size, dim=1)
     values = values.repeat_interleave(self.group_size, dim=1)
 
-    # 5. Scaled dot-product attention
     scores = queries @ keys.transpose(-2, -1)
     scores = scores / self.head_dim ** 0.5
     scores = scores.masked_fill(mask, -torch.inf)
     weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(queries.dtype)
 
-    # 6. Aggregate and project back
     d_out = self.num_heads * self.head_dim
     context = (weights @ values).transpose(1, 2).reshape(batch, seq_len, d_out)
     return self.out_proj(context)
 ```
 
-Several things in here deserve explanation:
+Four things in here deserve explanation:
 
-**QK normalization.** Qwen3 applies RMSNorm to queries and keys *after* projection but *before* RoPE. Most models (LLaMA, Mistral) don't do this. QK-norm stabilizes attention scores and prevents them from growing too large in deep models. Skip it and the logits won't match the reference. It's a Qwen3-specific detail that's easy to miss when you're working from a generic transformer blueprint.
+**QK normalization.** Qwen3 applies RMSNorm to queries and keys *after* projection but *before* RoPE. Most models don't do this at all. QK-norm stabilizes attention scores in deep models. The order matters: apply it before RoPE or you get wrong results. This is a Qwen3-specific detail that's easy to miss from a generic transformer diagram.
 
-**Softmax in float32.** The line `torch.softmax(scores, dim=-1, dtype=torch.float32)` is not optional. Softmax involves exponentiation, and in bfloat16, large attention scores can overflow to infinity. Casting just the softmax to float32 (and then back) is cheap and prevents NaN attention weights.
+**Softmax in float32.** `dtype=torch.float32` in softmax is not optional. Softmax involves exponentiation, and in bfloat16 large attention scores can overflow to infinity, producing NaN attention weights that propagate through everything downstream. Casting just the softmax to float32 — then casting back — costs almost nothing and prevents this.
 
-**`-torch.inf` for the causal mask.** The causal mask zeros out future positions so each token can only attend to past tokens. I use `-torch.inf` rather than `-1e9`. In bfloat16, a value like `-1e9` might not be sufficiently negative to produce *exact* zeros after softmax — there can be tiny amounts of attention leakage to future positions. `-torch.inf` guarantees exact zeros, period.
+**`-torch.inf` for the causal mask.** The causal mask zeros future positions so each token only attends to past ones. Using `-torch.inf` rather than `-1e9` guarantees exact zeros after softmax. In bfloat16, `-1e9` might not be sufficiently negative — tiny residual attention can leak to future positions. `-torch.inf` makes softmax produce exactly 0. No floating-point surprises.
+
+**KV head expansion after RoPE.** The `repeat_interleave` that expands 8 KV heads to 16 happens *after* applying RoPE. Expanding before RoPE and then rotating means you're rotating already-duplicated tensors — twice the compute for the same result.
 
 ---
 
-## Putting it together: Transformer Block and full model
+## Putting it together
 
-Each of the 28 blocks follows the pre-norm pattern — normalize *before* each sub-layer, not after:
+Each of the 28 transformer blocks follows the pre-norm pattern: normalize *before* each sub-layer, not after:
 
 ```python
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg: Qwen3Config) -> None:
-        super().__init__()
-        self.att = GroupedQueryAttention(...)
-        self.ff = FeedForward(cfg)
-        self.norm1 = RMSNorm(cfg.emb_dim)
-        self.norm2 = RMSNorm(cfg.emb_dim)
-
     def forward(self, x, mask, cos, sin):
-        x = x + self.att(self.norm1(x), mask, cos, sin)  # norm → attn → residual
+        x = x + self.att(self.norm1(x), mask, cos, sin)  # norm → attention → residual
         x = x + self.ff(self.norm2(x))                   # norm → FFN → residual
         return x
 ```
 
-Pre-norm (normalize before the sub-layer) is the modern standard. The original "Attention Is All You Need" used post-norm (normalize after), but pre-norm trains more stably, especially at depth.
+Pre-norm is the modern standard. The original "Attention Is All You Need" used post-norm, but pre-norm trains more stably at depth. With pre-norm, the residual connection carries the raw representation without normalization — gradient flow is cleaner.
 
-The full model assembles the pieces:
+The full model:
 
 ```python
 class Qwen3Model(nn.Module):
@@ -383,12 +378,10 @@ class Qwen3Model(nn.Module):
         self.final_norm = RMSNorm(cfg.emb_dim)
         self.out_head = nn.Linear(cfg.emb_dim, cfg.vocab_size, bias=False, dtype=cfg.dtype)
 
-        # Pre-compute RoPE tables — registered as buffers so they move with the model
         cos, sin = compute_rope_params(cfg.head_dim, cfg.context_length, cfg.rope_base)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
-        # Pre-allocate full causal mask, sliced in forward
         causal_mask = torch.triu(
             torch.ones(cfg.context_length, cfg.context_length, dtype=torch.bool),
             diagonal=1,
@@ -405,32 +398,30 @@ class Qwen3Model(nn.Module):
         return self.out_head(x.to(self.cfg.dtype))
 ```
 
-A few deliberate choices here:
+`register_buffer` with `persistent=False`: these tensors move with the model when you call `.to(device)` — they automatically land on the right device — but they're not saved in checkpoints, because they can always be recomputed from config. The RoPE tables and causal mask are constants, not parameters.
 
-`register_buffer` with `persistent=False` means these tensors move with the model when you call `.to(device)` — so they automatically land on the right device — but they're not saved in state_dict checkpoints (they can always be recomputed from config). The RoPE tables and causal mask are constants derived from hyperparameters; treating them as parameters would be wrong.
-
-Pre-allocating the full causal mask and slicing it in `forward` (`self.causal_mask[:seq_len, :seq_len]`) avoids creating a new tensor on every forward call. Small optimization, but correct practice.
+Pre-allocating the full causal mask and slicing it in `forward` avoids allocating a new tensor on every forward call. Minor optimization, correct practice.
 
 ---
 
 ## Loading real weights
 
-We have an architecture. Now we need to load actual trained weights into it.
+We have an architecture. Now we need actual trained weights.
 
-The weights live on HuggingFace as a safetensors file. Downloading is easy — `huggingface_hub` handles caching so the ~1.2 GB file is only downloaded once:
+The weights live on HuggingFace as a safetensors file. Downloading is handled by `huggingface_hub`:
 
 ```python
 def download_and_load_weights(model: Qwen3Model, repo_id: str = "Qwen/Qwen3-0.6B") -> None:
     local_dir = Path(repo_id).parts[-1]
     weights_path = hf_hub_download(
-        repo_id=repo_id,
-        filename="model.safetensors",
-        local_dir=local_dir,
+        repo_id=repo_id, filename="model.safetensors", local_dir=local_dir,
     )
     weights = load_file(weights_path)
     load_weights_into_qwen(model, weights)
-    del weights  # free the raw dict immediately — it's a full copy of all parameters
+    del weights  # free the raw dict — it's a full copy of all parameters
 ```
+
+The `del weights` is not cosmetic. The raw weights dict holds a full copy of ~600M parameters. If you don't free it after loading, you're keeping two copies of the model in memory simultaneously. On a machine with 8 GB of RAM, that hurts.
 
 The tricky part is `load_weights_into_qwen`. HuggingFace uses its own naming convention:
 
@@ -438,20 +429,12 @@ The tricky part is `load_weights_into_qwen`. HuggingFace uses its own naming con
 model.embed_tokens.weight
 model.layers.0.self_attn.q_proj.weight
 model.layers.0.self_attn.k_proj.weight
-model.layers.0.self_attn.v_proj.weight
-model.layers.0.self_attn.o_proj.weight
-model.layers.0.self_attn.q_norm.weight
-model.layers.0.self_attn.k_norm.weight
-model.layers.0.input_layernorm.weight
-model.layers.0.post_attention_layernorm.weight
 model.layers.0.mlp.gate_proj.weight
 model.layers.0.mlp.up_proj.weight
-model.layers.0.mlp.down_proj.weight
 ...
-model.norm.weight
 ```
 
-We need to copy each tensor into the right parameter in our model:
+We copy each tensor into the right parameter with explicit mappings:
 
 ```python
 def load_weights_into_qwen(model, weights):
@@ -461,69 +444,62 @@ def load_weights_into_qwen(model, weights):
 
     copy_(model.tok_emb.weight, weights["model.embed_tokens.weight"])
 
-    for layer_idx in range(model.cfg.n_layers):
-        block = model.trf_blocks[layer_idx]
-        prefix = f"model.layers.{layer_idx}"
+    for i in range(model.cfg.n_layers):
+        block = model.trf_blocks[i]
+        p = f"model.layers.{i}"
 
-        copy_(block.att.W_query.weight,  weights[f"{prefix}.self_attn.q_proj.weight"])
-        copy_(block.att.W_key.weight,    weights[f"{prefix}.self_attn.k_proj.weight"])
-        copy_(block.att.W_value.weight,  weights[f"{prefix}.self_attn.v_proj.weight"])
-        copy_(block.att.out_proj.weight, weights[f"{prefix}.self_attn.o_proj.weight"])
-
-        if block.att.q_norm is not None:
-            copy_(block.att.q_norm.scale, weights[f"{prefix}.self_attn.q_norm.weight"])
-            copy_(block.att.k_norm.scale, weights[f"{prefix}.self_attn.k_norm.weight"])
-
-        copy_(block.norm1.scale, weights[f"{prefix}.input_layernorm.weight"])
-        copy_(block.norm2.scale, weights[f"{prefix}.post_attention_layernorm.weight"])
-
-        copy_(block.ff.fc1.weight, weights[f"{prefix}.mlp.gate_proj.weight"])
-        copy_(block.ff.fc2.weight, weights[f"{prefix}.mlp.up_proj.weight"])
-        copy_(block.ff.fc3.weight, weights[f"{prefix}.mlp.down_proj.weight"])
+        copy_(block.att.W_query.weight,  weights[f"{p}.self_attn.q_proj.weight"])
+        copy_(block.att.W_key.weight,    weights[f"{p}.self_attn.k_proj.weight"])
+        copy_(block.att.W_value.weight,  weights[f"{p}.self_attn.v_proj.weight"])
+        copy_(block.att.out_proj.weight, weights[f"{p}.self_attn.o_proj.weight"])
+        copy_(block.att.q_norm.scale,    weights[f"{p}.self_attn.q_norm.weight"])
+        copy_(block.att.k_norm.scale,    weights[f"{p}.self_attn.k_norm.weight"])
+        copy_(block.norm1.scale,         weights[f"{p}.input_layernorm.weight"])
+        copy_(block.norm2.scale,         weights[f"{p}.post_attention_layernorm.weight"])
+        copy_(block.ff.fc1.weight,       weights[f"{p}.mlp.gate_proj.weight"])
+        copy_(block.ff.fc2.weight,       weights[f"{p}.mlp.up_proj.weight"])
+        copy_(block.ff.fc3.weight,       weights[f"{p}.mlp.down_proj.weight"])
 
     copy_(model.final_norm.scale, weights["model.norm.weight"])
 
-    # Weight tying: Qwen3-0.6B doesn't have a separate lm_head.weight
     if "lm_head.weight" in weights:
         copy_(model.out_head.weight, weights["lm_head.weight"])
     else:
         model.out_head.weight = model.tok_emb.weight
 ```
 
-That last block — weight tying — caught me off guard. Qwen3-0.6B shares the output projection weights with the token embedding table. There is no `lm_head.weight` key in the safetensors file. If you create a separate `nn.Linear` for the output head (as I do), you have to explicitly detect this absence and point `out_head.weight` to `tok_emb.weight`. Miss this and your output head has random initialized weights and the model outputs complete garbage — and it will do so confidently, because it has 600M parameters worth of good hidden representations feeding into a randomly initialized projection.
+That last block — weight tying — caught me completely off guard. Qwen3-0.6B shares the output projection weights with the token embedding table. There is no `lm_head.weight` key in the safetensors file. If you create a separate `nn.Linear` for the output head and forget to detect this, your output head has randomly initialized weights. The model produces beautiful intermediate representations through all 28 layers and then destroys them with a random projection at the end. The output is total garbage. The hidden states are completely fine. I spent an embarrassing amount of time looking at the wrong thing before I found this.
 
 ---
 
 ## Tokenizer
 
-Text in, token IDs out. Token IDs in, text out. That's the tokenizer's job.
+Text in, token IDs out. Token IDs in, text out.
 
-Qwen3 uses a BPE tokenizer, and its definition lives in `tokenizer.json` on HuggingFace. We could load it with `AutoTokenizer` from the `transformers` library, but that would bring `transformers` into the runtime dependency stack, which I want to avoid. Instead, we use the lightweight `tokenizers` library (also by HuggingFace) which can load `tokenizer.json` directly.
+Qwen3 uses BPE, and the tokenizer lives in `tokenizer.json` on HuggingFace. We could use `AutoTokenizer` from `transformers`, but that would bring `transformers` into the runtime dependency stack. Instead, we use the lighter `tokenizers` library which can load `tokenizer.json` directly.
 
-The tricky part is special tokens. Qwen3 has many of them: `<|im_start|>`, `<|im_end|>`, `<think>`, `</think>`, and more. The raw BPE tokenizer sometimes splits these into sub-pieces instead of treating them atomically. The fix: split the input text at special token boundaries first, handle specials by direct ID lookup, and BPE-encode the rest:
+The one wrinkle: special tokens. Qwen3 has many — `<|im_start|>`, `<|im_end|>`, `<think>`, `</think>`, and more. The raw BPE tokenizer sometimes splits these into sub-pieces instead of treating them as atomic units. The fix: split the input text at special token boundaries first, handle those by direct ID lookup, BPE-encode everything else:
 
 ```python
-_SPECIAL_TOKENS = ("<|endoftext|>", "<|im_start|>", "<|im_end|>", "<think>", "</think>", ...)
 _SPLIT_RE = re.compile("(" + "|".join(re.escape(t) for t in _SPECIAL_TOKENS) + ")")
 
-class Qwen3Tokenizer:
-    def encode(self, text: str) -> list[int]:
-        ids: list[int] = []
-        for part in filter(None, _SPLIT_RE.split(text)):
-            if part in self._special_to_id:
-                ids.append(self._special_to_id[part])
-            else:
-                ids.extend(self._tok.encode(part).ids)
-        return ids
+def encode(self, text: str) -> list[int]:
+    ids: list[int] = []
+    for part in filter(None, _SPLIT_RE.split(text)):
+        if part in self._special_to_id:
+            ids.append(self._special_to_id[part])
+        else:
+            ids.extend(self._tok.encode(part).ids)
+    return ids
 ```
 
-One more thing: the EOS token for Qwen3 is `<|im_end|>`, *not* `<|endoftext|>`. Qwen3 uses the ChatML message format where `<|im_end|>` marks the end of an assistant turn. If you stop at `<|endoftext|>` instead, generation just... keeps going. Depending on your `max_tokens` limit, you might not notice for a while.
+One more thing: the EOS token for Qwen3 is `<|im_end|>`, not `<|endoftext|>`. Qwen3 uses the ChatML message format where `<|im_end|>` marks the end of an assistant turn. If you stop on `<|endoftext|>` instead, generation just keeps going. Depending on your `max_tokens` limit, you might not notice for a while — outputs just get progressively longer and never terminate naturally.
 
 ---
 
 ## The generation loop
 
-Here's the entire autoregressive generation loop:
+Here's the complete autoregressive generation loop:
 
 ```python
 @torch.no_grad()
@@ -532,7 +508,7 @@ def generate(model, input_ids, max_new_tokens, eos_token_id=None):
     tokens = input_ids
 
     for _ in range(max_new_tokens):
-        logits = model(tokens)                                  # [1, seq_len, vocab]
+        logits = model(tokens)                                   # [1, seq_len, vocab]
         next_token = logits[:, -1].argmax(dim=-1, keepdim=True) # [1, 1]
         tokens = torch.cat([tokens, next_token], dim=1)
 
@@ -544,23 +520,21 @@ def generate(model, input_ids, max_new_tokens, eos_token_id=None):
 
 That's it. That's the whole thing.
 
-On every step: run the full forward pass over the entire sequence, look at only the last position's logits, pick the highest-probability token (argmax = greedy decoding), append it to the sequence, repeat.
+On every step: full forward pass over the entire sequence, look at only the last position's logits, pick the highest-probability token, append it to the sequence, repeat.
 
-This is "naive" in a precise sense: we're feeding the *entire sequence* — prompt plus all generated tokens so far — through all 28 layers on every single step. For token #100, we re-compute the attention for tokens #1–99 even though they haven't changed. This is O(n²) in sequence length: each new token makes the next step proportionally slower.
+This is "naive" in a precise computational sense. On step 100, we're recomputing keys and values for positions 1 through 99 even though they haven't changed. Every additional token in context makes every future step proportionally more expensive. This is O(n²) — and we'll see exactly how bad that is in the benchmarks section.
 
-The fix is a KV-cache: store the keys and values computed during prefill, and on each subsequent step, only compute the new token's query against the cached keys and values. That turns decode from O(n) per step to O(1) per step. We'll implement it in the next tutorial. For now, we accept the slowness and appreciate the clarity.
-
-`argmax` always picks the highest-probability token, which is deterministic and "safe" but can be repetitive. Temperature, top-k, and top-p sampling (which add controlled randomness) are Tutorial 3.
+`argmax` always picks the single most probable token. Deterministic, correct, produces reasonable output for factual queries. But it has a failure mode: it always picks the most "expected" continuation. For open-ended generation, this tends toward safe, repetitive output. We address this in Tutorial 2 with sampling.
 
 ---
 
 ## How do we know it's correct?
 
-This is, I'd argue, the most important part of the whole project.
+This is the most important section in the tutorial.
 
-Without tests, you have no idea whether your implementation is correct. The model might output plausible-looking text while getting every attention score slightly wrong. Visual inspection can't catch precision bugs. You need a reference.
+Without a reference implementation to test against, you have no idea whether your model is actually correct. The model might output plausible-looking text while getting every attention score slightly wrong. Logits can look reasonable even when the computations have bugs. Visual inspection is hopeless. You need a ground truth.
 
-The approach: load both our model and the HuggingFace `transformers` version of Qwen3-0.6B with identical weights, feed them the same input, and compare outputs.
+The approach: load both our model and HuggingFace's `transformers` version with identical weights, feed them the same input, compare outputs:
 
 ```python
 def test_logits_argmax_matches_single_forward(our_model, hf_model, input_ids):
@@ -573,53 +547,55 @@ def test_logits_argmax_matches_single_forward(our_model, hf_model, input_ids):
     assert diff.max().item() < 1.0
 ```
 
-Why compare argmax rather than exact logit values? Because bfloat16 arithmetic is not associative — the order of operations affects the result. Our implementation and HuggingFace's perform the same mathematical operations in slightly different orders (different code paths, different fused kernels). Raw logit values will differ by small amounts, typically well under 0.5. But the *argmax* — which token has the highest probability — should be identical. If it's not, we have a real correctness bug.
+Why compare argmax rather than exact logit values? Because bfloat16 arithmetic is not associative — the order of floating-point operations affects the result. Our implementation and HuggingFace's perform mathematically identical operations in slightly different orders (different code paths, different loop ordering). Raw logit values will differ by small amounts, typically under 0.5. But the *argmax* — which token has the highest probability — should be identical. If it's not, that's a real correctness bug.
 
-We also run a generation comparison test: 20-token greedy generation, token-by-token equality. If single-forward argmax matches, generation should too. Running both catches edge cases.
+We also run a generation comparison: 20-token greedy generation, token-by-token equality. Both tests together cover single-forward accuracy and sequential accumulation.
 
-**The one-keyword-argument bug that cost me hours.** When loading the HuggingFace model for testing, you must specify:
+**The hidden bug that opened this article.** Loading the HuggingFace model for comparison requires:
 
 ```python
 hf_model = AutoModelForCausalLM.from_pretrained(
     REPO_ID,
     dtype=torch.bfloat16,
-    attn_implementation="eager",  # <-- this
+    attn_implementation="eager",  # ← this is critical
 )
 ```
 
-By default, HuggingFace uses `sdpa` (PyTorch's fused `scaled_dot_product_attention` kernel) which uses different internal precision and operation ordering than manual matmul + softmax. With `sdpa`, the argmax mismatches in ~2-3% of positions. I spent a long time checking my RoPE implementation, my normalization math, my weight loading — everything looked correct. The actual fix was adding `attn_implementation="eager"` to force HuggingFace down the same explicit code path we use. One argument. Discovered after far too many hours.
+By default, HuggingFace uses PyTorch's fused `scaled_dot_product_attention` kernel, which uses different internal precision than explicit matmul + softmax. With the default setting, the argmax mismatches in ~2–3% of positions. I spent the better part of a day checking my RoPE implementation, normalization math, weight loading. All correct. The actual fix was one argument, forcing HuggingFace to use the same explicit attention code path we use. One keyword argument. Found after far too long.
 
-Fixtures use `scope="module"` — models are loaded once per test file, not per test function. Loading a 600M parameter model takes several seconds; you don't want to pay that cost for every test.
+Fixtures use `scope="module"` — models load once per test file. Loading a 600M-parameter model takes several seconds; you don't want to pay that per test function.
 
 ---
 
-## Everything that went wrong
+## All the things that went wrong
 
-Let me consolidate all the precision and correctness traps from above. If you're following along and your outputs don't match the reference, this is where to look:
+Let me consolidate everything. If your implementation doesn't match the reference, start here.
 
 | Issue | Symptom | Fix |
 |---|---|---|
 | Missing float32 upcast in RMSNorm | Logits diverge slightly | Cast to float32 for variance computation, cast back |
-| Wrong `rope_base` (10k vs 1M) | Garbage on longer sequences; short sequence logit mismatch too | Use value from `config.json`: 1,000,000 |
+| Wrong `rope_base` (10k instead of 1M) | Any sequence mismatch; garbage on longer sequences | Use value from `config.json`: 1,000,000 |
 | Interleaved vs split-half RoPE | Completely wrong attention patterns | Use split-half: `cat([-x2, x1], dim=-1)` |
-| Swapped `gate_proj` / `up_proj` | Model generates nonsense, runs fine | `fc1=gate_proj`, `fc2=up_proj`, `fc3=down_proj` |
-| Missing QK normalization | Logits don't match HF; instability on long sequences | Apply RMSNorm to Q and K after projection, before RoPE |
-| Missing weight tying | Output head has random weights; coherent hidden states → garbage output | Point `out_head.weight` to `tok_emb.weight` |
-| Wrong EOS token | Generation never stops | `<|im_end|>` is the EOS, not `<|endoftext|>` |
-| HF using SDPA by default in tests | Argmax mismatches ~2-3% of positions | `attn_implementation="eager"` in the HF model fixture |
+| Swapped `gate_proj` / `up_proj` | Runs fine; nonsense output | `fc1=gate_proj`, `fc2=up_proj`, `fc3=down_proj` |
+| Missing QK normalization | Logit mismatch; instability on long sequences | Apply RMSNorm to Q and K after projection, before RoPE |
+| Missing weight tying | Coherent hidden states → garbage output | Point `out_head.weight` to `tok_emb.weight` |
+| Wrong EOS token | Generation never stops | `<|im_end|>` is EOS, not `<|endoftext|>` |
+| HF using SDPA by default in tests | Argmax mismatches ~2–3% of positions | `attn_implementation="eager"` |
 | Softmax in bfloat16 | Overflow to inf, NaN attention weights | `torch.softmax(..., dtype=torch.float32)` |
-| `-1e9` instead of `-torch.inf` for causal mask | Subtle attention leakage to future tokens | Use `-torch.inf` |
-| Not deleting weight dict after loading | Out of memory on lower-RAM machines | `del weights` after `load_weights_into_qwen` |
+| `-1e9` instead of `-torch.inf` for mask | Subtle attention leakage to future tokens | Use `-torch.inf` |
+| Not freeing weight dict | OOM on low-RAM machines | `del weights` after `load_weights_into_qwen` |
 
-I hit all eleven of these. The good news: having a reference implementation to test against means none of them can hide. They all surface as test failures. Write the tests first.
+I hit all eleven. Having a reference implementation to test against means none of them can hide — they all surface as test failures. Write the tests first.
 
 ---
 
-## How fast (or slow) is it?
+## How fast is it?
 
-Let's see the damage. The benchmark harness in `src/pumpference/benchmark.py` measures prefill throughput, decode throughput, time-to-first-token (TTFT), per-token decode latency (p50/p90/p99), and peak memory. All numbers below are from a single run on an Apple M3 Pro CPU, bfloat16 weights, 100 generated tokens per preset.
+Let's see the damage.
 
-| Preset | Prompt tokens | Prefill TPS | TTFT | Decode TPS | Latency mean | P50 | P99 | Peak memory |
+The benchmark harness in `src/pumpference/benchmark.py` measures prefill throughput, decode throughput, time-to-first-token (TTFT), per-token decode latency (p50/p90/p99), and peak memory. Four prompt presets at increasing context lengths: `xs` (~30 tokens), `short` (~115), `medium` (~218), `long` (~372). All numbers from Apple M3 Pro CPU, bfloat16, 100 generated tokens per preset.
+
+| Preset | Prompt tok | Prefill TPS | TTFT | Decode TPS | Mean latency | P50 | P99 | Peak memory |
 |--------|:---:|---:|---:|---:|---:|---:|---:|---:|
 | xs     |  30  | 102.1 tok/s |  294 ms | 1.3 tok/s |  777 ms/tok |  762 ms |  1750 ms | 4122 MB |
 | short  | 115  | 105.2 tok/s | 1093 ms | 0.6 tok/s | 1749 ms/tok | 1696 ms |  2784 ms | 4013 MB |
@@ -628,31 +604,33 @@ Let's see the damage. The benchmark harness in `src/pumpference/benchmark.py` me
 
 ![Baseline benchmark — decode throughput, per-token latency, and TTFT across context lengths](assets/baseline-benchmark.png)
 
-**Prefill is relatively fast.** Processing 372 tokens takes 5264 ms — about 17.9× longer than 30 tokens (294 ms). Slightly superlinear but not dramatically so.
+**Prefill is reasonable.** From 30 to 372 tokens (12.4×), TTFT goes from 294 ms to 5264 ms (17.9×). Slightly superlinear — attention is O(n²) even for prefill — but prefill processes all tokens in parallel, so memory bandwidth dominates at these sizes, not sequence-length iteration.
 
-**Decode is catastrophically slow and clearly O(n²).** The per-token decode latency goes from 777 ms at a 30-token context to 6321 ms at a 372-token context — an 8× slowdown for a 12× increase in context length. That's O(n²) behavior: each new token makes every future token proportionally more expensive. At 0.2 tok/s on a 372-token prompt, this implementation is unusable for anything practical.
+**Decode is catastrophically O(n²).** Per-token latency goes from 777 ms at a 30-token context to 6321 ms at 372 tokens. That's an **8× slowdown for a 12× increase in context length**. The signature of quadratic scaling. At 0.2 tok/s on a 372-token prompt, this is unusable for anything interactive.
 
-**The P99 spike on xs tells the story clearly.** For the xs preset, P50 latency is 762 ms but P99 jumps to 1750 ms — a 2.3× spread. This makes perfect sense: the first decode step processes 31 tokens (fast), the last processes 129 tokens (slow). P50 captures the typical middle; P99 reflects the worst late-generation steps when the context is longest. For the long preset, the spread narrows (P50=6284 ms, P99=7612 ms, 1.2×) because all steps start from an already-large context and the proportional growth per step is smaller.
+**The P99 spike on `xs` is the most revealing number in the table.** P50 decode latency for `xs` is 762 ms. P99 is 1750 ms — a 2.3× spread within a single 100-token run. This isn't noise. It's the O(n²) cost structure in plain sight: the first decode step processes 31 tokens (fast), the last processes 129 tokens (slow). The median step is somewhere around 80 tokens. The distribution isn't a distribution — it's a slope. For `long`, the spread narrows (P50=6284, P99=7612, 1.2×) because all decode steps start from an already-large context and the proportional growth per additional step is smaller.
 
-**Peak memory is ~4 GB regardless of context.** Almost all of that is model weights (~1.2 GB in bfloat16) amplified by intermediate activations and PyTorch's allocator overhead. The KV-cache we'll add next will *increase* memory — that's the trade: more memory for dramatically faster decode.
+**Memory is ~4 GB everywhere.** Model weights are ~1.2 GB in bfloat16. The rest is PyTorch's allocator, Python runtime, and intermediate activation buffers. It barely varies with context length because we're not caching anything. When we add a KV-cache in Tutorial 4, this number will go up. That's the explicit trade: more memory for dramatically faster decode.
 
-These numbers are our baseline. Every subsequent optimization tutorial will report new numbers against this table.
+These are our baseline numbers. Every subsequent optimization tutorial reports against this table.
 
 ---
 
 ## What's next
 
-- **Tutorial 2**: Sampling — temperature, top-k, and top-p (nucleus) sampling. Argmax always picks the single most probable token, which produces deterministic but often repetitive output. Sampling strategies let you trade some probability mass for diversity, and getting the details right (correct temperature scaling, proper renormalization after top-k truncation) is trickier than it looks.
+The model works and it's slow. Before worrying about the slowness, let's make it more interesting to talk to.
+
+**Tutorial 2**: Sampling. Right now `argmax` always picks the single most probable token — correct, deterministic, and tends toward safe, predictable output. Temperature, top-k, and top-p sampling add controlled randomness, letting you trade some probability mass for diversity. Getting the implementation right, especially top-p, is more interesting than it looks.
 
 ---
 
-*This article is part of the Pumpference tutorial series. The full source code is at [github.com/legchikov/pumpference](https://github.com/legchikov/pumpference).*
+*This is part of the Pumpference tutorial series. Source code: [github.com/legchikov/pumpference](https://github.com/legchikov/pumpference).*
 
-*Found an error? Open an issue or PR.*
+*Found an error? Open an issue.*
 
 ---
 
 ## References
 
-- Sebastian Raschka's from-scratch Qwen3 implementation was the primary reference baseline: [notebook](https://github.com/rasbt/LLMs-from-scratch/blob/main/ch05/11_qwen3/standalone-qwen3.ipynb) and [blog post](https://sebastianraschka.com/blog/2025/qwen3-from-scratch.html).
-- [Qwen3 Technical Report](https://arxiv.org/abs/2505.09388) — the original paper describing the architecture and training details.
+- Sebastian Raschka's from-scratch Qwen3: [notebook](https://github.com/rasbt/LLMs-from-scratch/blob/main/ch05/11_qwen3/standalone-qwen3.ipynb) and [blog post](https://sebastianraschka.com/blog/2025/qwen3-from-scratch.html).
+- [Qwen3 Technical Report](https://arxiv.org/abs/2505.09388).
