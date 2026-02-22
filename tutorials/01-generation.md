@@ -626,6 +626,8 @@ Let's see the damage. The benchmark harness in `src/pumpference/benchmark.py` me
 | medium | 218  |  90.9 tok/s | 2398 ms | 0.3 tok/s | 3323 ms/tok | 3252 ms |  6003 ms | 3738 MB |
 | long   | 372  |  70.7 tok/s | 5264 ms | 0.2 tok/s | 6321 ms/tok | 6284 ms |  7612 ms | 3783 MB |
 
+![Baseline benchmark — decode throughput, per-token latency, and TTFT across context lengths](assets/baseline-benchmark.png)
+
 **Prefill is relatively fast.** Processing 372 tokens takes 5264 ms — about 17.9× longer than 30 tokens (294 ms). Slightly superlinear but not dramatically so.
 
 **Decode is catastrophically slow and clearly O(n²).** The per-token decode latency goes from 777 ms at a 30-token context to 6321 ms at a 372-token context — an 8× slowdown for a 12× increase in context length. That's O(n²) behavior: each new token makes every future token proportionally more expensive. At 0.2 tok/s on a 372-token prompt, this implementation is unusable for anything practical.
