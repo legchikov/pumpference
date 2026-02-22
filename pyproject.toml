@@ -1,0 +1,27 @@
+[project]
+name = "pumpference"
+version = "0.1.0"
+description = "Educational LLM inference playground in plain PyTorch."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "torch>=2.0",
+  "safetensors",
+  "huggingface_hub",
+  "tokenizers",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0.0",
+  "transformers>=4.51.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = ["-ra"]

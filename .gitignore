@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+
+# Downloaded HuggingFace model weights
+Qwen3-*/
+
+# Benchmark results
+benchmarks/
+
+.DS_Store
