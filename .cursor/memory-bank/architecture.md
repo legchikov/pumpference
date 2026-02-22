@@ -12,7 +12,7 @@ pumpference/
 │       ├── __init__.py         # Public API: Qwen3Model, QWEN3_0_6B_CONFIG, generate
 │       ├── __main__.py         # CLI entry point (argparse, device detection, load, generate)
 │       ├── model.py            # All architecture components + config + weight loading (~340 lines)
-│       ├── generate.py         # Greedy generation loop (~40 lines)
+│       ├── generate.py         # Greedy + sampling generation loop (~110 lines)
 │       ├── tokenizer.py        # Qwen3Tokenizer wrapper over HF tokenizers lib (~80 lines)
 │       └── benchmark.py        # Benchmark harness: TPS, TTFT, memory, JSON output (~440 lines)
 ├── benchmarks/                 # Auto-created; JSON results from benchmark runs (gitignored)
@@ -20,10 +20,9 @@ pumpference/
 │   ├── conftest.py             # sys.path setup for src layout
 │   └── test_model.py           # Comparison tests vs HuggingFace transformers
 └── tutorials/
-    ├── 01-naive-inference.md   # Tutorial 1: building naive inference from scratch
-    ├── 02-sampling.md          # Tutorial 2: sampling strategies (placeholder)
-    ├── 03-benchmarking.md      # Tutorial 3: benchmarking (placeholder)
-    └── 04-kv-cache.md          # Tutorial 4: KV-cache (placeholder)
+    ├── 01-generation.md        # Tutorial 1: building naive inference from scratch (full walkthrough)
+    ├── 02-sampling.md          # Tutorial 2: temperature, top-k, top-p decoding (dev-log)
+    └── 03-benchmarking.md      # Tutorial 3: benchmarking harness (dev-log)
 ```
 
 ## Model architecture (Qwen3-0.6B)
@@ -55,7 +54,7 @@ input_ids [batch, seq_len]
   → logits [batch, seq_len, 151936]
 ```
 
-Generation loop (in `generate.py`): feeds full sequence on every step (no KV-cache), takes argmax of last position logits, appends to sequence, repeats.
+Generation loop (in `generate.py`): feeds full sequence on every step (no KV-cache). `sample_next_token` selects the next token — greedy argmax when `temperature=0`, otherwise applies temperature scaling → optional top-k filter → optional top-p (nucleus) filter → `torch.multinomial`.
 
 ## Key design decisions
 
@@ -83,5 +82,7 @@ Generation loop (in `generate.py`): feeds full sequence on every step (no KV-cac
 Tests in `test_model.py` use `scope="module"` fixtures (models loaded once). Two tests:
 1. `test_logits_argmax_matches_single_forward` — compares argmax at every position + checks max logit diff < 1.0
 2. `test_greedy_generation_matches_hf` — 20-token greedy generation, token-by-token equality
+
+`test_sampling.py` — 17 unit tests for sampling strategies (no model load required): greedy equivalence, reproducibility, top-k / top-p correctness, composability, output shape.
 
 HF model must use `attn_implementation="eager"` for numerical consistency with manual attention.

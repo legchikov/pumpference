@@ -131,20 +131,20 @@ NVIDIA A100-SXM4-80GB, CUDA, bfloat16, 100 generated tokens per preset, one warm
 
 | Preset | Prompt tok | Prefill TPS | TTFT | Decode TPS | Mean latency | P50 | P99 | Peak memory |
 |--------|:---:|---:|---:|---:|---:|---:|---:|---:|
-| xs     |  30  |    997.6 tok/s |  30 ms | 37.9 tok/s |  26.4 ms/tok |  26.4 ms |   29.5 ms | 3239 MB |
-| short  | 115  |  3,739.7 tok/s |  31 ms | 37.0 tok/s |  27.0 ms/tok |  27.0 ms |   29.4 ms | 3540 MB |
-| medium | 218  |  7,348.5 tok/s |  30 ms | 32.6 tok/s |  30.6 ms/tok |  26.2 ms | 225.8 ms | 3969 MB |
-| long   | 372  | 12,384.4 tok/s |  30 ms | 37.8 tok/s |  26.4 ms/tok |  26.4 ms |   28.0 ms | 4708 MB |
+| xs     |  30  |    997.6 tok/s |  30 ms | 37.9 tok/s |  26.4 ms/tok |  26.4 ms |  29.5 ms | 3239 MB |
+| short  | 115  |  3,739.7 tok/s |  31 ms | 37.0 tok/s |  27.0 ms/tok |  27.0 ms |  29.4 ms | 3540 MB |
+| medium | 218  |  7,084.3 tok/s |  31 ms | 36.6 tok/s |  27.3 ms/tok |  27.3 ms |  28.5 ms | 3969 MB |
+| long   | 372  | 12,500.7 tok/s |  30 ms | 37.8 tok/s |  26.4 ms/tok |  26.4 ms |  29.5 ms | 4708 MB |
 
 ![GPU baseline benchmark — decode throughput, per-token latency, and TTFT across context lengths](assets/gpu-baseline-benchmark.png)
 
-**TTFT is flat.** 30 ms for 30 tokens, 30 ms for 372 tokens. On CPU, TTFT grew from 294 ms to 5264 ms — a 17.9× stretch. On GPU, it barely moves. The A100 processes all 372 prompt tokens in a single forward pass, and the full parallelism of the hardware absorbs the extra compute without the user noticing. This is the most striking single number in the table.
+**TTFT is flat.** 30–31 ms across all presets. On CPU, TTFT grew from 294 ms to 5264 ms — a 17.9× stretch. On GPU, it barely moves. The A100 processes all 372 prompt tokens in a single forward pass, and the full parallelism of the hardware absorbs the extra compute without the user noticing. This is the most striking single number in the table.
 
-**Prefill TPS scales superlinearly.** From 30 to 372 tokens (12.4×), prefill throughput goes from 998 to 12,384 tok/s (12.4× too — near exactly linear). That might look linear, but the mechanism is different at each size. At 30 tokens, the GPU is largely idle — most tensor cores aren't doing useful work because the matrices are too small to saturate them. As the prompt grows, the computation becomes dense enough that the GPU's parallelism fully engages. The A100 is a machine built to eat large matrix multiplications; small batches starve it.
+**Prefill TPS scales superlinearly.** From 30 to 372 tokens (12.4×), prefill throughput goes from 998 to 12,501 tok/s (12.5×). That might look linear, but the mechanism is different at each size. At 30 tokens, the GPU is largely idle — most tensor cores aren't doing useful work because the matrices are too small to saturate them. As the prompt grows, the computation becomes dense enough that the GPU's parallelism fully engages. The A100 is a machine built to eat large matrix multiplications; small batches starve it.
 
 **The O(n²) signature is gone.** Decode TPS is 37.9 tok/s at 30 tokens and 37.8 tok/s at 372 tokens. The quadratic cost is not gone — every decode step still reprocesses the full growing sequence — but the GPU's FLOPS headroom is large enough that the O(n²) component doesn't show up within 100 steps at these context lengths. Per-step latency is a flat ~26 ms whether the context is 31 tokens or 471 tokens. The KV-cache will still matter (it removes the quadratic compute entirely), but the motivation on GPU is different: not survival, but efficiency and scalability to longer contexts.
 
-**The medium preset outliers are not O(n²).** P99 for `medium` is 225 ms — an 8.6× spike above P50. Two steps in the 99-step sequence hit 225 ms and 192 ms; all the rest are ~26 ms. This is not the gradual growth pattern of O(n²) (that would look like a slope from P50 to P99). These are discrete jumps, consistent with CUDA's memory manager defragmenting the allocator mid-run or a driver-level interrupt. The mean latency for `medium` (30.6 ms) and the lower decode TPS (32.6 vs ~37.8) both reflect these two outlier steps. The underlying steady-state throughput is the same as the other presets.
+**Decode latency is uniform across all presets.** P50 is 26–27 ms and P99 is 28–30 ms regardless of whether the context is 30 or 372 tokens. No preset shows a meaningful outlier. This confirms that the O(n²) compute growth is completely absorbed by the GPU's memory bandwidth and FLOPS headroom at these context lengths — the quadratic component simply isn't visible in 100 decode steps starting from sub-400-token contexts.
 
 **Memory grows, as expected.** 3239 MB at 30 tokens, 4708 MB at 372 tokens. Model weights are ~1.2 GB. No KV-cache, so the allocator creates and frees activation buffers on every forward pass — but the peak allocation scales with sequence length because the attention weight matrices (n × n per layer) are larger at longer contexts. This growth is the cost of recomputation. The KV-cache trades it for a different kind of growth: stored KV tensors that accumulate linearly rather than the peak-and-free pattern here.
 

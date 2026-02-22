@@ -93,9 +93,6 @@ def main() -> None:
     ax.set_title("Decode latency (ms/tok)", fontsize=10, color=GREY, pad=8)
     ax.set_ylabel("ms / token", fontsize=9, color=GREY)
     ax.legend(fontsize=8, framealpha=0.5)
-    ax.annotate("outlier\nspike", xy=(2, lat_p99[2]), xytext=(2.3, lat_p99[2] * 0.85),
-                fontsize=7.5, color="#c44e52",
-                arrowprops=dict(arrowstyle="->", color="#c44e52", lw=0.9))
 
     # --- Panel 3: TTFT ---
     ax = axes[2]
