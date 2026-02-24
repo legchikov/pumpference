@@ -6,23 +6,30 @@
 pumpference/
 ├── pyproject.toml              # Project config, dependencies, pytest settings
 ├── uv.lock                     # Locked dependency versions
-├── Makefile                    # lint / format / test / bench shortcuts
+├── Makefile                    # lint / format / test / bench / profile shortcuts
 ├── src/
 │   └── pumpference/
-│       ├── __init__.py         # Public API: Qwen3Model, QWEN3_0_6B_CONFIG, generate
-│       ├── __main__.py         # CLI entry point (argparse, device detection, load, generate)
-│       ├── model.py            # All architecture components + config + weight loading (~340 lines)
+│       ├── __init__.py         # Public API: Qwen3Model, QWEN3_0_6B_CONFIG, generate, quantize_model
+│       ├── __main__.py         # CLI entry point (argparse, device detection, load, generate, --quantize)
+│       ├── model.py            # All architecture components + config + weight loading (~470 lines)
 │       ├── generate.py         # Greedy + sampling generation loop (~110 lines)
 │       ├── tokenizer.py        # Qwen3Tokenizer wrapper over HF tokenizers lib (~80 lines)
-│       └── benchmark.py        # Benchmark harness: TPS, TTFT, memory, JSON output (~440 lines)
+│       ├── benchmark.py        # Benchmark harness: TPS, TTFT, memory, JSON output; --quantize flag
+│       ├── profile.py          # Profiling harness: hook-based per-layer timing + torch.profiler
+│       └── quantize.py         # Weight-only quantization: Int8Linear, Int4Linear, quantize_model
 ├── benchmarks/                 # Auto-created; JSON results from benchmark runs (gitignored)
 ├── tests/
 │   ├── conftest.py             # sys.path setup for src layout
-│   └── test_model.py           # Comparison tests vs HuggingFace transformers
+│   ├── test_model.py           # Comparison tests vs HuggingFace transformers
+│   ├── test_sampling.py        # Sampling strategy unit tests (no model)
+│   └── test_quantize.py        # Quantization correctness + structural tests
 └── tutorials/
     ├── 01-generation.md        # Tutorial 1: building naive inference from scratch (full walkthrough)
     ├── 02-sampling.md          # Tutorial 2: temperature, top-k, top-p decoding (dev-log)
-    └── 03-benchmarking.md      # Tutorial 3: benchmarking harness (dev-log)
+    ├── 03-benchmarking.md      # Tutorial 3: benchmarking harness (dev-log)
+    ├── 04-kv-cache.md          # Tutorial 4: KV-cache (dev-log)
+    ├── 05-profiling.md         # Tutorial 5: profiling decode step (dev-log)
+    └── 06-quantization.md      # Tutorial 6: weight-only quantization (dev-log)
 ```
 
 ## Model architecture (Qwen3-0.6B)
@@ -43,6 +50,24 @@ Decoder-only transformer with the following components in `model.py`:
 | `Qwen3Model` | Full model: embedding → 28 blocks → final norm → linear head; accepts kv_cache |
 | `load_weights_into_qwen()` | Maps HuggingFace weight names to our parameter names |
 | `download_and_load_weights()` | Downloads safetensors from HF Hub and calls load function |
+
+**Quantization (`quantize.py`):**
+
+| Class / Function | Purpose |
+|---|---|
+| `quantize_per_channel_absmax()` | Symmetric per-row int8 quantization; returns `(int8_weight, scale)` |
+| `quantize_per_group()` | Symmetric group-wise int4 quantization; packs two values per byte; returns `(packed_uint8, scales)` |
+| `unpack_int4()` | Unpacks and dequantizes int4 back to float32 |
+| `Int8Linear` | Drop-in for `nn.Linear`; stores int8 weight + float32 scale; dequantizes on forward |
+| `Int4Linear` | Drop-in for `nn.Linear`; stores packed uint8 weight + float32 group scales; unpacks on forward |
+| `quantize_model()` | Replaces all `nn.Linear` in model with quantized variant in-place |
+
+**Profiling (`profile.py`):**
+
+| Function | Purpose |
+|---|---|
+| `_coarse_profile()` | Registers forward hooks on each module; times 10 decode steps; returns mean ms per module |
+| `_fine_profile()` | Runs `torch.profiler.profile` over 5 decode steps; prints top-20 operators; optionally exports Chrome trace |
 
 ## Data flow
 
@@ -87,6 +112,8 @@ Tests in `test_model.py` use `scope="module"` fixtures (models loaded once). Fiv
 4. `test_kv_cache_generation_matches_no_cache` — cached generation produces bit-identical tokens to naive path
 5. `test_kv_cache_generation_matches_hf` — cached generation matches HuggingFace
 
-`test_sampling.py` — 17 unit tests for sampling strategies (no model load required): greedy equivalence, reproducibility, top-k / top-p correctness, composability, output shape.
+`test_sampling.py` — 2 unit tests for sampling strategies (no model load required).
+
+`test_quantize.py` — 11 tests for quantization: primitive round-trip, output shapes, structural (no nn.Linear remaining), memory reduction, argmax agreement (int8 ≥ 85%, int4 ≥ 70% on 30-token prompt), and generation runs without error.
 
 HF model must use `attn_implementation="eager"` for numerical consistency with manual attention.

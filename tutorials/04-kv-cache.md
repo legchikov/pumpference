@@ -95,6 +95,50 @@ The KV-cache's GPU benefit becomes significant at longer sequences (thousands of
 
 With the cache in place, GPU is 3–4× faster than CPU in absolute terms. Without the cache, GPU was already fast at these lengths; it was CPU that suffered catastrophically from the quadratic compute pattern.
 
+## Comparison: with and without KV-cache
+
+### Decode throughput across all modes
+
+All numbers are decode tok/s, 100 tokens generated, bfloat16.
+
+| Prompt tokens | CPU naive | CPU cached | GPU naive | GPU cached |
+|---------------|-----------|------------|-----------|------------|
+| 30 | 1.3 | **12.0** | 37.9 | **40.0** |
+| 115 | 0.6 | **12.6** | 37.0 | **38.2** |
+| 218 | 0.3 | **8.5** | 36.6 | **37.8** |
+| 372 | 0.2 | **9.2** | 37.8 | **37.6** |
+
+The two devices tell opposite stories.
+
+On CPU, the cache is the difference between a usable system and a broken one. Decode goes from 0.2 tok/s (one token every 5 seconds) to 9.2 tok/s at the long preset — a 46× speedup. The naive CPU numbers aren't just slow in absolute terms, they get worse with every token. Sequence length grows → O(n²) cost grows → each successive decode step takes longer than the previous one.
+
+On GPU, the cache makes almost no difference: 37.9 → 40.0 at xs (5%), 37.8 → 37.6 at long (essentially zero). The GPU's weight-loading bottleneck is the same whether it recomputes attention over 30 tokens or 400; the extra work costs little relative to the fixed per-layer parameter load.
+
+### Latency stability: naive CPU latency degrades mid-generation
+
+The latency data for CPU naive xs shows a characteristic quadratic growth pattern — early steps are fast, later ones are slow because the sequence is longer:
+
+| Decode step | CPU naive lat | CPU cached lat | GPU naive lat | GPU cached lat |
+|-------------|--------------|----------------|---------------|----------------|
+| step 1 | 272 ms | ~84 ms | 27.6 ms | 38.5 ms |
+| step 50 | ~850 ms | ~83 ms | ~26.4 ms | ~24.7 ms |
+| step 99 (last) | ~1 400 ms | ~84 ms | ~26.4 ms | ~24.7 ms |
+
+CPU naive latency grows 5× within a single generation run. CPU cached latency is flat (each step processes exactly 1 token). GPU latency is flat in both modes — the attention work at 30–130 tokens is negligible on GPU regardless of implementation.
+
+The P99 numbers make this concrete. CPU naive xs: P99 = **1749 ms** vs mean = 777 ms. The tail is 2.3× the mean because the later decode steps are so much more expensive. CPU cached xs: P99 = **188 ms** vs mean = 84 ms — still some variance (system noise) but no systematic growth. GPU is tight in both modes: P99 within ~15% of mean.
+
+### When the cache matters
+
+| Condition | Cache benefit | Why |
+|-----------|---------------|-----|
+| CPU, any context length | Very large (9–46×) | Attention is the bottleneck; cache eliminates redundant O(n²) work |
+| GPU, short context (< ~1000 tok) | Negligible (~0–5%) | Weight loading dominates; attention is cheap at these sizes |
+| GPU, long context (thousands of tok) | Significant | Attention matrices eventually become large enough to rival weight loading |
+| Latency stability | Always beneficial | Cache makes per-step cost constant; naive path grows monotonically |
+
+The KV-cache is not primarily a GPU optimisation at inference scale. Its first beneficiary is CPU-class hardware — laptops, edge devices, anything that cannot absorb the quadratic attention cost with raw parallelism. On GPU it pays off at the sequence lengths typical of production workloads (multi-turn conversations, long documents), not at the short benchmark sequences we test here.
+
 ## Worth looking at in the code
 
 The position offset logic in `Qwen3Model.forward()` is the linchpin of the whole implementation. It is two lines, but they do everything:

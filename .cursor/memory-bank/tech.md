@@ -54,6 +54,7 @@ uv run pytest          # run tests (downloads ~1.2GB model on first run)
 | `make format` | `ruff check --fix` on `src tests` |
 | `make test` | `pytest --cov` |
 | `make bench [PRESET=<alias>]` | Run benchmark; `PRESET` accepts named aliases or token counts |
+| `make profile [PRESET=<alias>]` | Run profiler (coarse + torch.profiler); outputs per-layer ms and top operators |
 
 **Benchmark presets** (`PRESET` variable, default `xs`):
 
@@ -75,9 +76,10 @@ uv run pytest          # run tests (downloads ~1.2GB model on first run)
 
 - No GPU required — runs on CPU (also supports CUDA and MPS)
 - bfloat16 precision throughout (matches HF distribution)
-- Current generation is O(n²) per token (no KV-cache yet)
+- Generation is O(n) per token with KV-cache (default); O(n²) naive path available via `use_cache=False`
 - Sampling decoding: temperature, top-k, top-p (nucleus) — all composable; temperature=0 falls back to greedy
 - Single-sequence inference only (batch size = 1)
+- Weight-only quantization available (`--quantize int8|int4`) but dequantize-on-forward is slower on CPU without fused kernels
 
 ## Testing strategy
 

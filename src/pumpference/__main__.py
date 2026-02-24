@@ -11,6 +11,7 @@ import torch
 
 from .generate import generate
 from .model import QWEN3_0_6B_CONFIG, Qwen3Model, download_and_load_weights
+from .quantize import quantize_model
 from .tokenizer import download_tokenizer
 
 
@@ -54,6 +55,12 @@ def main() -> None:
         default=1.0,
         help="Nucleus sampling threshold: cumulative probability cutoff (1.0 = disabled, default: 1.0)",
     )
+    parser.add_argument(
+        "--quantize",
+        choices=["none", "int8", "int4"],
+        default="none",
+        help="Weight-only quantization: none (default), int8, or int4",
+    )
     args = parser.parse_args()
 
     # --- Device -----------------------------------------------------------
@@ -72,6 +79,9 @@ def main() -> None:
     print("Loading model …")
     model = Qwen3Model(QWEN3_0_6B_CONFIG)
     download_and_load_weights(model, repo_id=QWEN3_0_6B_CONFIG.repo_id)
+    if args.quantize != "none":
+        print(f"Quantizing weights ({args.quantize}) …")
+        quantize_model(model, mode=args.quantize)
     model.to(device)
     model.eval()
 

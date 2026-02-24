@@ -28,6 +28,7 @@ from statistics import mean, quantiles
 import torch
 
 from .model import QWEN3_0_6B_CONFIG, KVCache, Qwen3Model, download_and_load_weights
+from .quantize import quantize_model
 from .tokenizer import download_tokenizer
 
 
@@ -137,6 +138,7 @@ class BenchmarkResult:
     git_commit: str
     device: str
     dtype: str
+    quantization: str
     model: str
     prompt_tokens: int
     generated_tokens: int
@@ -195,6 +197,7 @@ def timed_generate(
     max_new_tokens: int,
     eos_token_id: int | None,
     device: torch.device,
+    quantization: str = "none",
 ) -> tuple[torch.Tensor, BenchmarkResult]:
     """
     Run greedy generation with KV-cache while measuring prefill, decode, and memory.
@@ -269,6 +272,7 @@ def timed_generate(
         git_commit=_git_commit(),
         device=str(device),
         dtype=str(QWEN3_0_6B_CONFIG.dtype).replace("torch.", ""),
+        quantization=quantization,
         model=QWEN3_0_6B_CONFIG.repo_id.split("/")[-1],
         prompt_tokens=prompt_len,
         generated_tokens=generated_tokens,
@@ -293,11 +297,13 @@ W = 51  # table width
 
 def format_results(result: BenchmarkResult) -> str:
     lat = result.per_token_latency_ms
+    quant_label = result.quantization if result.quantization != "none" else "none (bfloat16)"
     lines = [
         "═" * W,
         f"  pumpference benchmark — {result.model}",
         "═" * W,
         f"  Device:             {result.device} ({result.dtype})",
+        f"  Quantization:       {quant_label}",
         f"  Prompt tokens:      {result.prompt_tokens}",
         f"  Generated tokens:   {result.generated_tokens}",
         "─" * W,
@@ -386,6 +392,12 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=1, help="Warmup runs before timing")
     parser.add_argument("--output-dir", type=str, default="benchmarks")
+    parser.add_argument(
+        "--quantize",
+        choices=["none", "int8", "int4"],
+        default="none",
+        help="Weight-only quantization: none (default), int8, or int4",
+    )
     args = parser.parse_args()
 
     # Resolve prompt — named alias → token count → prompt text
@@ -409,6 +421,9 @@ def main() -> None:
     print(f"Loading model on {device} …")
     model = Qwen3Model(QWEN3_0_6B_CONFIG)
     download_and_load_weights(model, repo_id=QWEN3_0_6B_CONFIG.repo_id)
+    if args.quantize != "none":
+        print(f"Quantizing weights ({args.quantize}) …")
+        quantize_model(model, mode=args.quantize)
     model.to(device)
     model.eval()
 
@@ -431,6 +446,7 @@ def main() -> None:
         max_new_tokens=args.max_tokens,
         eos_token_id=tokenizer.eos_token_id,
         device=device,
+        quantization=args.quantize,
     )
 
     # --- Output ---

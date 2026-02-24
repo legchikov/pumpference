@@ -14,3 +14,6 @@ PRESET ?= xs
 
 bench:
 	@uv run python -m pumpference.benchmark --preset $(PRESET)
+
+profile:
+	@uv run python -m pumpference.profile --preset $(PRESET)
