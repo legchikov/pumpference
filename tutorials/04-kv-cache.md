@@ -43,7 +43,7 @@ The `generate()` function accepts `use_cache=False` to fall back to the naive fu
 
 ## Results
 
-All runs on Apple M3 Pro, CPU, bfloat16, 100 tokens generated, 1 warmup pass.
+### CPU (Apple M3 Pro, bfloat16, 100 tokens generated)
 
 | Preset | Prompt tokens | Decode TPS (naive) | Decode TPS (KV-cache) | Speedup |
 |--------|---------------|--------------------|-----------------------|---------|
@@ -54,9 +54,46 @@ All runs on Apple M3 Pro, CPU, bfloat16, 100 tokens generated, 1 warmup pass.
 
 The speedup grows with prompt length because the naive path scales as O(P²) per decode step — doubling the prompt roughly quadruples the per-token cost. The cached path's decode cost scales as O(P) per step, so the baseline penalty grows faster than the cache penalty, widening the gap.
 
-Decode TPS plateaus around 9–13 tok/s across prompt lengths (with some noise from the test system). This is the signature of the O(n) regime: cost grows slowly with sequence length rather than catastrophically. The small variation you see is the linear term: at 372 tokens, each decode step computes `Q @ K^T` over a [1 × 372] attention matrix, which is modestly more work than the [1 × 30] case at xs.
+Decode TPS plateaus around 9–13 tok/s across prompt lengths (with some noise from the test system). This is the signature of the O(n) regime: cost grows slowly with sequence length rather than catastrophically.
 
-Prefill speed is unchanged — that pass always processes all P tokens in parallel and benefits from no optimisation here.
+### GPU (CUDA, bfloat16, 100 tokens generated)
+
+| Preset | Prompt tokens | Prefill TPS | TTFT | Decode TPS | Mean lat | P99 lat | Peak memory |
+|--------|---------------|-------------|------|------------|----------|---------|-------------|
+| xs | 30 | 1 010 | 29.7 ms | 40.0 | 25.0 ms | 38.5 ms | 3 178 MB |
+| short | 115 | 3 602 | 31.9 ms | 38.2 | 26.2 ms | 40.1 ms | 3 463 MB |
+| medium | 218 | 6 650 | 32.8 ms | 37.8 | 26.5 ms | 48.3 ms | 3 874 MB |
+| long | 372 | 10 996 | 33.8 ms | 37.6 | 26.6 ms | 39.6 ms | 4 587 MB |
+
+**Decode TPS is essentially flat**: 40.0 → 37.6 tok/s across 30 to 372 prompt tokens — a drop of only 6% while the context grows 12×. This is the O(n) signature made visible. On CPU the same experiment produced a 7× difference (12.0 vs 1.7 tok/s); on GPU it barely registers.
+
+**Prefill TPS scales with prompt length**: 1 010 → 10 996 tok/s, an 11× increase as the prompt grows 12×. This is the GPU's parallelism at work in the opposite direction — at 30 tokens the attention matrices are tiny (30×1024) and most CUDA cores sit idle. At 372 tokens the matrices fill the hardware much better. This is why GPU batch inference becomes proportionally more efficient at longer inputs.
+
+**TTFT is nearly constant**: 29.7 ms for 30 tokens, 33.8 ms for 372 tokens — only 4 ms more to process 12× more input. GPU parallelism absorbs the larger prefill without meaningful wall-clock cost.
+
+### The surprising result: KV-cache is near-zero speedup on GPU at these lengths
+
+Comparing the new cached GPU numbers against the naive GPU benchmarks from before the cache was implemented:
+
+| Preset | Decode TPS (naive GPU) | Decode TPS (cached GPU) | Speedup |
+|--------|------------------------|-------------------------|---------|
+| medium (218) | 36.6 | 37.8 | 1.03× |
+| long (372) | 37.8 | 37.6 | 1.00× |
+
+The cache provides essentially no speedup on GPU at these sequence lengths. This is counterintuitive after the dramatic CPU results, but the explanation is straightforward: at 200–500 total tokens, the O(n²) attention work is small enough that the GPU handles it without effort. The bottleneck at these lengths is not the attention computation but the weight-loading bandwidth — iterating over the ~1.2 GB of model parameters on every token. That cost is identical with and without a cache, and it dominates.
+
+The KV-cache's GPU benefit becomes significant at longer sequences (thousands of tokens) where the attention matrices grow large enough to compete with weight-loading as a bottleneck. At production scale, systems like vLLM typically work with sequences 10–100× longer than what we tested here.
+
+### CPU vs GPU, cached
+
+| Preset | CPU cached (tok/s) | GPU cached (tok/s) | GPU advantage |
+|--------|--------------------|--------------------|---------------|
+| xs | 12.0 | 40.0 | 3.3× |
+| short | 12.6 | 38.2 | 3.0× |
+| medium | 8.5 | 37.8 | 4.4× |
+| long | 9.2 | 37.6 | 4.1× |
+
+With the cache in place, GPU is 3–4× faster than CPU in absolute terms. Without the cache, GPU was already fast at these lengths; it was CPU that suffered catastrophically from the quadratic compute pattern.
 
 ## Worth looking at in the code
 
@@ -74,4 +111,4 @@ The `KVCache.update()` method in `src/pumpference/model.py` is intentionally min
 
 ## What's next
 
-Profiling to understand where the remaining ~83 ms/tok goes on CPU — the attention computation, the feed-forward network, and weight-loading overhead are all candidates.
+Profiling to understand where the remaining ~26 ms/tok goes on GPU (and ~83 ms/tok on CPU). The GPU data suggests weight-loading bandwidth is the bottleneck at these sequence lengths — iterating over 1.2 GB of parameters on every token regardless of cache state. Quantisation (int8/int4 weights) would reduce that bandwidth and is the most direct path to higher throughput.
