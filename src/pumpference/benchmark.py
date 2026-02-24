@@ -27,7 +27,7 @@ from statistics import mean, quantiles
 
 import torch
 
-from .model import QWEN3_0_6B_CONFIG, Qwen3Model, download_and_load_weights
+from .model import QWEN3_0_6B_CONFIG, KVCache, Qwen3Model, download_and_load_weights
 from .tokenizer import download_tokenizer
 
 
@@ -196,31 +196,37 @@ def timed_generate(
     eos_token_id: int | None,
     device: torch.device,
 ) -> tuple[torch.Tensor, BenchmarkResult]:
-    """Run greedy generation while measuring prefill, decode, and memory."""
+    """
+    Run greedy generation with KV-cache while measuring prefill, decode, and memory.
+
+    Two-phase structure mirrors the cached generate() loop so the timings are
+    meaningful: prefill covers the full-prompt forward pass that fills the
+    cache, and decode measures the per-token cost when only one token is fed.
+    """
     model.eval()
-    tokens = input_ids
     prompt_len = input_ids.shape[1]
+    cache = KVCache()
 
     # --- Memory tracking setup ---
     use_cuda_mem = device.type == "cuda"
     if use_cuda_mem:
         torch.cuda.reset_peak_memory_stats(device)
 
-    # --- Prefill (first forward pass) ---
+    # --- Prefill (full prompt, fills the cache) ---
     _sync(device)
     t_prefill_start = time.perf_counter()
 
-    logits = model(tokens)
+    logits = model(input_ids, kv_cache=cache)
     next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
-    tokens = torch.cat([tokens, next_token], dim=1)
 
     _sync(device)
     t_prefill_end = time.perf_counter()
 
     prefill_ms = (t_prefill_end - t_prefill_start) * 1000.0
+    generated = [next_token]
     hit_eos = eos_token_id is not None and next_token.item() == eos_token_id
 
-    # --- Decode (remaining steps) ---
+    # --- Decode (single token per step, cache grows by one each step) ---
     decode_step_latencies: list[float] = []
 
     if not hit_eos:
@@ -228,17 +234,19 @@ def timed_generate(
             _sync(device)
             t_step_start = time.perf_counter()
 
-            logits = model(tokens)
+            logits = model(next_token, kv_cache=cache)
             next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
-            tokens = torch.cat([tokens, next_token], dim=1)
 
             _sync(device)
             t_step_end = time.perf_counter()
 
             decode_step_latencies.append((t_step_end - t_step_start) * 1000.0)
+            generated.append(next_token)
 
             if eos_token_id is not None and next_token.item() == eos_token_id:
                 break
+
+    tokens = torch.cat([input_ids, *generated], dim=1)
 
     # --- Memory measurement ---
     if use_cuda_mem:

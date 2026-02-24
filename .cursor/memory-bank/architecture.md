@@ -33,13 +33,14 @@ Decoder-only transformer with the following components in `model.py`:
 |---|---|
 | `Qwen3Config` | Dataclass holding all hyperparameters (vocab_size, n_heads, n_layers, etc.) |
 | `QWEN3_0_6B_CONFIG` | Singleton config instance for Qwen3-0.6B |
+| `KVCache` | Per-layer K/V cache: `update(layer_idx, k, v)` appends and returns accumulated tensors; `seq_len` property; `reset()` |
 | `RMSNorm` | Root Mean Square normalization (upcasts to float32 internally) |
 | `compute_rope_params()` | Pre-computes cos/sin tables for Rotary Positional Embeddings |
-| `apply_rope()` | Applies RoPE rotation to Q/K tensors (split-half convention) |
+| `apply_rope()` | Applies RoPE rotation to Q/K tensors (split-half); accepts pre-sliced cos/sin from caller |
 | `FeedForward` | SwiGLU FFN: silu(fc1(x)) * fc2(x) → fc3 (three linear layers) |
-| `GroupedQueryAttention` | GQA with 16 Q-heads, 8 KV-heads, optional QK-norm, causal masking |
-| `TransformerBlock` | Pre-norm block: norm→attn→residual, norm→FFN→residual |
-| `Qwen3Model` | Full model: token embedding → 28 transformer blocks → final norm → linear head |
+| `GroupedQueryAttention` | GQA with 16 Q-heads, 8 KV-heads, optional QK-norm; accepts kv_cache + layer_idx |
+| `TransformerBlock` | Pre-norm block: norm→attn→residual, norm→FFN→residual; threads kv_cache through |
+| `Qwen3Model` | Full model: embedding → 28 blocks → final norm → linear head; accepts kv_cache |
 | `load_weights_into_qwen()` | Maps HuggingFace weight names to our parameter names |
 | `download_and_load_weights()` | Downloads safetensors from HF Hub and calls load function |
 
@@ -54,7 +55,7 @@ input_ids [batch, seq_len]
   → logits [batch, seq_len, 151936]
 ```
 
-Generation loop (in `generate.py`): feeds full sequence on every step (no KV-cache). `sample_next_token` selects the next token — greedy argmax when `temperature=0`, otherwise applies temperature scaling → optional top-k filter → optional top-p (nucleus) filter → `torch.multinomial`.
+Generation loop (in `generate.py`): two-phase when `use_cache=True` (default): phase 1 prefills the full prompt and fills the `KVCache`, phase 2 feeds one token per step. `use_cache=False` retains the original full-sequence recompute path. `sample_next_token` selects the next token — greedy argmax when `temperature=0`, otherwise applies temperature scaling → optional top-k filter → optional top-p (nucleus) filter → `torch.multinomial`.
 
 ## Key design decisions
 
@@ -79,9 +80,12 @@ Generation loop (in `generate.py`): feeds full sequence on every step (no KV-cac
 
 ## Test architecture
 
-Tests in `test_model.py` use `scope="module"` fixtures (models loaded once). Two tests:
+Tests in `test_model.py` use `scope="module"` fixtures (models loaded once). Five tests:
 1. `test_logits_argmax_matches_single_forward` — compares argmax at every position + checks max logit diff < 1.0
 2. `test_greedy_generation_matches_hf` — 20-token greedy generation, token-by-token equality
+3. `test_kv_cache_prefill_logits_match` — prefill with empty cache produces identical logits to uncached forward
+4. `test_kv_cache_generation_matches_no_cache` — cached generation produces bit-identical tokens to naive path
+5. `test_kv_cache_generation_matches_hf` — cached generation matches HuggingFace
 
 `test_sampling.py` — 17 unit tests for sampling strategies (no model load required): greedy equivalence, reproducibility, top-k / top-p correctness, composability, output shape.
 

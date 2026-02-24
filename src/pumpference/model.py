@@ -4,8 +4,10 @@ Qwen3 0.6B model architecture
 Based on: https://github.com/rasbt/LLMs-from-scratch/blob/main/ch05/11_qwen3/standalone-qwen3.ipynb
 
 Architecture components:
-  RMSNorm, RoPE, FeedForward (SwiGLU), GroupedQueryAttention
+  RMSNorm, RoPE, FeedForward (SwiGLU), GroupedQueryAttention, KVCache
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +41,69 @@ class Qwen3Config:
 
 
 QWEN3_0_6B_CONFIG = Qwen3Config()
+
+
+# ---------------------------------------------------------------------------
+# KV-Cache
+# ---------------------------------------------------------------------------
+
+class KVCache:
+    """
+    Per-layer key/value cache for autoregressive generation.
+
+    During the prefill pass (full prompt), the model stores K and V for every
+    token in this cache.  On subsequent decode steps each layer appends the
+    single new token's K/V and returns the full accumulated tensor so the
+    query can attend to the entire past context.
+
+    Tensors are stored at KV-head granularity (num_kv_groups heads) BEFORE
+    the repeat_interleave expansion.  This is intentional:
+      - K and V are cached *after* QK-norm and *after* RoPE so positional
+        encoding is already baked in and never needs to be re-applied.
+      - Storing pre-expansion saves memory (8 heads instead of 16 for GQA).
+
+    Shape of each cached tensor: [batch, num_kv_groups, seq_len, head_dim]
+    """
+
+    def __init__(self) -> None:
+        # One (K, V) tuple per transformer layer, populated lazily.
+        self._cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def update(
+        self,
+        layer_idx: int,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Append *keys* and *values* for *layer_idx* and return the full
+        accumulated K/V tensors for that layer.
+
+        On the first call for a given layer (prefill) the tensors are stored
+        as-is.  On subsequent calls (decode) the new single-token slice is
+        concatenated along dim=2 (the sequence dimension).
+        """
+        if layer_idx < len(self._cache):
+            prev_k, prev_v = self._cache[layer_idx]
+            keys = torch.cat([prev_k, keys], dim=2)
+            values = torch.cat([prev_v, values], dim=2)
+            self._cache[layer_idx] = (keys, values)
+        else:
+            self._cache.append((keys, values))
+        return keys, values
+
+    def reset(self) -> None:
+        """Clear all cached tensors (call before a new generation request)."""
+        self._cache.clear()
+
+    @property
+    def seq_len(self) -> int:
+        """Number of tokens currently stored in the cache (0 if empty)."""
+        return self._cache[0][0].shape[2] if self._cache else 0
 
 
 # ---------------------------------------------------------------------------
@@ -88,14 +153,22 @@ def apply_rope(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply RoPE to a tensor of shape [batch, heads, seq_len, head_dim]."""
-    _, _, seq_len, head_dim = x.shape
+    """
+    Apply RoPE to a tensor of shape [batch, heads, seq_len, head_dim].
+
+    *cos* and *sin* must already be sliced to the correct position range by
+    the caller (shape [seq_len, head_dim]).  This allows the same function to
+    handle both the full-sequence prefill pass and the single-token decode
+    pass without any internal position arithmetic.
+    """
+    _, _, _, head_dim = x.shape
 
     x1 = x[..., : head_dim // 2]
     x2 = x[..., head_dim // 2 :]
 
-    cos = cos[:seq_len].unsqueeze(0).unsqueeze(0)   # [1, 1, seq_len, head_dim]
-    sin = sin[:seq_len].unsqueeze(0).unsqueeze(0)
+    # Broadcast over batch and head dimensions.
+    cos = cos.unsqueeze(0).unsqueeze(0)   # [1, 1, seq_len, head_dim]
+    sin = sin.unsqueeze(0).unsqueeze(0)
 
     rotated = torch.cat((-x2, x1), dim=-1)
     return ((x * cos) + (rotated * sin)).to(x.dtype)
@@ -160,6 +233,8 @@ class GroupedQueryAttention(nn.Module):
         mask: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        kv_cache: KVCache | None = None,
+        layer_idx: int = 0,
     ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
 
@@ -175,22 +250,33 @@ class GroupedQueryAttention(nn.Module):
             keys = self.k_norm(keys)
 
         # Apply RoPE ----------------------------------------------------------
+        # cos/sin are already sliced to the correct position window by the
+        # model's forward — no further slicing needed here.
         queries = apply_rope(queries, cos, sin)
         keys = apply_rope(keys, cos, sin)
+
+        # KV-cache: store K/V after RoPE (positional encoding baked in) and
+        # before GQA expansion (saves memory at KV-head granularity).
+        # update() appends the new slice and returns the full past+current K/V.
+        if kv_cache is not None:
+            keys, values = kv_cache.update(layer_idx, keys, values)
 
         # Expand KV heads to match Q heads ------------------------------------
         keys = keys.repeat_interleave(self.group_size, dim=1)
         values = values.repeat_interleave(self.group_size, dim=1)
 
         # Scaled dot-product attention ----------------------------------------
+        # scores shape: [batch, num_heads, q_len, kv_len]
         scores = queries @ keys.transpose(-2, -1)
         scores = scores / self.head_dim ** 0.5
         scores = scores.masked_fill(mask, -torch.inf)
         weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(queries.dtype)
 
         # Combine heads -------------------------------------------------------
+        # q_len may differ from kv_len during cached decode (q_len == 1).
+        q_len = queries.shape[2]
         d_out = self.num_heads * self.head_dim
-        context = (weights @ values).transpose(1, 2).reshape(batch, seq_len, d_out)
+        context = (weights @ values).transpose(1, 2).reshape(batch, q_len, d_out)
         return self.out_proj(context)
 
 
@@ -221,8 +307,10 @@ class TransformerBlock(nn.Module):
         mask: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        kv_cache: KVCache | None = None,
+        layer_idx: int = 0,
     ) -> torch.Tensor:
-        x = x + self.att(self.norm1(x), mask, cos, sin)
+        x = x + self.att(self.norm1(x), mask, cos, sin, kv_cache=kv_cache, layer_idx=layer_idx)
         x = x + self.ff(self.norm2(x))
         return x
 
@@ -257,15 +345,55 @@ class Qwen3Model(nn.Module):
         )
         self.register_buffer("causal_mask", causal_mask, persistent=False)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Return logits of shape [batch, seq_len, vocab_size]."""
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        kv_cache: KVCache | None = None,
+    ) -> torch.Tensor:
+        """
+        Return logits of shape [batch, seq_len, vocab_size].
+
+        When *kv_cache* is provided the model operates in one of two modes:
+
+        Prefill  (cache is empty, input_ids is the full prompt):
+          - Processes all P tokens in parallel as usual.
+          - Each layer stores its K/V tensors in the cache.
+          - Returns logits for all P positions (caller uses only the last one).
+
+        Decode  (cache has P tokens, input_ids is a single new token):
+          - Processes only the 1 new token.
+          - cos/sin are sliced to position P (the new token's true position).
+          - The attention mask is all-False: the single query can attend to
+            the full cached context — no future tokens exist to mask.
+          - Each layer appends the new K/V to the cache.
+          - Returns logits for the 1 new position.
+        """
         x = self.tok_emb(input_ids)
 
-        seq_len = x.shape[1]
-        mask = self.causal_mask[:seq_len, :seq_len]
+        q_len = x.shape[1]
 
-        for block in self.trf_blocks:
-            x = block(x, mask, self.cos, self.sin)
+        # Compute the position offset: 0 for the first (prefill) call,
+        # cache.seq_len for every subsequent decode call.
+        past_len = kv_cache.seq_len if kv_cache is not None else 0
+
+        # Pre-slice RoPE tables to the exact position window [past_len, past_len + q_len).
+        # Both prefill (past_len=0, q_len=P) and decode (past_len=P, q_len=1) work
+        # correctly without any further slicing inside apply_rope.
+        cos = self.cos[past_len : past_len + q_len]
+        sin = self.sin[past_len : past_len + q_len]
+
+        # Build the attention mask for scores of shape [q_len, kv_len].
+        kv_len = past_len + q_len
+        if past_len == 0:
+            # Standard causal mask: token i cannot attend to token j > i.
+            mask = self.causal_mask[:q_len, :kv_len]
+        else:
+            # Single new token during decode: it can attend to all past tokens
+            # plus itself — no future tokens exist to block, so mask is all-False.
+            mask = torch.zeros(q_len, kv_len, dtype=torch.bool, device=x.device)
+
+        for layer_idx, block in enumerate(self.trf_blocks):
+            x = block(x, mask, cos, sin, kv_cache=kv_cache, layer_idx=layer_idx)
 
         x = self.final_norm(x)
         return self.out_head(x.to(self.cfg.dtype))

@@ -11,7 +11,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from pumpference.generate import generate
-from pumpference.model import QWEN3_0_6B_CONFIG, Qwen3Model, download_and_load_weights
+from pumpference.model import QWEN3_0_6B_CONFIG, KVCache, Qwen3Model, download_and_load_weights
 from pumpference.tokenizer import download_tokenizer
 
 REPO_ID = "Qwen/Qwen3-0.6B" # https://huggingface.co/Qwen/Qwen3-0.6B
@@ -128,4 +128,74 @@ def test_greedy_generation_matches_hf(our_model, hf_model, input_ids) -> None:
         f"Token mismatch!\n"
         f"  Ours: {our_tokens}\n"
         f"  HF:   {hf_tokens}"
+    )
+
+
+# ------------------------------------------------------------------
+# KV-cache correctness tests
+# ------------------------------------------------------------------
+
+@torch.no_grad()
+def test_kv_cache_prefill_logits_match(our_model, input_ids) -> None:
+    """
+    Prefill with an empty cache must produce exactly the same logits as the
+    uncached forward pass.  This validates that adding kv_cache=cache to the
+    forward call does not change computation when past_len == 0.
+    """
+    cache = KVCache()
+
+    logits_no_cache = our_model(input_ids)
+    logits_with_cache = our_model(input_ids, kv_cache=cache)
+
+    assert torch.equal(logits_no_cache, logits_with_cache), (
+        "Prefill logits differ between cached and uncached forward passes"
+    )
+
+
+@torch.no_grad()
+def test_kv_cache_generation_matches_no_cache(our_model, input_ids) -> None:
+    """
+    Cached generation must produce bit-identical tokens to the naive
+    full-sequence recompute path.  This is the definitive correctness test
+    for the KV-cache: same result, different computation path.
+    """
+    cached_output = generate(
+        our_model,
+        input_ids.clone(),
+        max_new_tokens=MAX_NEW_TOKENS,
+        use_cache=True,
+    )
+    naive_output = generate(
+        our_model,
+        input_ids.clone(),
+        max_new_tokens=MAX_NEW_TOKENS,
+        use_cache=False,
+    )
+
+    assert cached_output[0].tolist() == naive_output[0].tolist(), (
+        f"Cached and uncached generation produced different tokens!\n"
+        f"  Cached: {cached_output[0].tolist()}\n"
+        f"  Naive:  {naive_output[0].tolist()}"
+    )
+
+
+@torch.no_grad()
+def test_kv_cache_generation_matches_hf(our_model, hf_model, input_ids) -> None:
+    """Cached generation must produce the same tokens as HuggingFace."""
+    our_output = generate(
+        our_model,
+        input_ids.clone(),
+        max_new_tokens=MAX_NEW_TOKENS,
+        use_cache=True,
+    )
+    hf_output = _hf_greedy_generate(
+        hf_model,
+        input_ids.clone(),
+        max_new_tokens=MAX_NEW_TOKENS,
+    )
+
+    assert our_output[0].tolist() == hf_output[0].tolist(), (
+        f"Cached generation differs from HuggingFace!\n"
+        f"  Ours (cached): {our_output[0].tolist()}\n"
+        f"  HF:            {hf_output[0].tolist()}"
     )

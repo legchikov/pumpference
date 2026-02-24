@@ -27,29 +27,33 @@ The **benchmark harness is complete**. The naive inference is verified correct a
 
 ## Current work focus
 
-Sampling decoding is complete. Tutorial 2 written.
+KV-cache is complete. Tutorial 4 written.
 
-## What has been added (sampling)
+## What has been added (KV-cache)
 
-- `sample_next_token(logits, temperature, top_k, top_p)` function in `generate.py`
-  - `temperature=0` → greedy argmax (backward-compatible default)
-  - top-k: masks all but the k highest-logit tokens before sampling
-  - top-p (nucleus): cumulative-probability threshold with shift-right logic; always keeps position 0
-  - Final softmax in float32; `torch.multinomial` for stochastic draw
-- `generate()` updated to accept and pass through `temperature`, `top_k`, `top_p`
-- CLI (`__main__.py`) exposes `--temperature`, `--top-k`, `--top-p` flags
-- `sample_next_token` exported from `__init__.py`
-- 17 unit tests in `tests/test_sampling.py` (no model load required): greedy equivalence, reproducibility, top-k/top-p correctness, composability, output shape
-- Tutorial 2 written: `tutorials/02-sampling.md`
+- `KVCache` class in `model.py`: per-layer K/V storage, `update(layer_idx, keys, values)` → appends and returns full accumulated tensors, `reset()`, `seq_len` property
+- `apply_rope` simplified: internal `cos[:seq_len]` slicing removed; caller pre-slices to the correct position window
+- `GroupedQueryAttention.forward()` extended: accepts `kv_cache` and `layer_idx`, calls `kv_cache.update()` after RoPE and QK-norm, before GQA `repeat_interleave` expansion
+- `TransformerBlock.forward()` threads `kv_cache` and `layer_idx` down to attention
+- `Qwen3Model.forward()` extended: accepts `kv_cache`, computes `past_len = kv_cache.seq_len`, pre-slices RoPE tables to `[past_len, past_len+q_len)`, builds all-False decode mask when `past_len > 0`
+- `generate()` extended: `use_cache=True` default runs two-phase loop (prefill full prompt → decode single token per step); `use_cache=False` retains naive path for comparison
+- `benchmark.py` `timed_generate()` updated to use the two-phase cached approach
+- `KVCache` exported from `__init__.py`
+- 3 new tests in `test_model.py`: prefill logits identity, cached-vs-naive token identity, cached-vs-HF token identity
+- Tutorial 4 written: `tutorials/04-kv-cache.md`
 
-## Tutorial format decision
+## KV-cache benchmark results (CPU bfloat16, 100 tokens generated)
 
-Tutorials 2+ are **dev-log articles**, not step-by-step code walkthroughs. Code always lives in `src/pumpference/` on `main`. Tutorials cover: current state + baseline metric, motivation, key decisions (why, not what), gotchas table, results table with real numbers, and optional focused code snippet. No "before/after" diffs, no git tags. Full format documented in `AGENTS.md` and `.cursor/plans/tutorial_writing_format_dc7867c5.plan.md`.
+| Preset | Prompt tok | Decode TPS (naive) | Decode TPS (cached) | Speedup |
+|--------|-----------|--------------------|--------------------|---------|
+| xs (30 tok) | 30 | 1.3 | 12.0 | 9.2× |
+| short (115 tok) | 115 | 0.6 | 12.6 | 21× |
+| medium (218 tok) | 218 | 0.3 | 8.5 | 28× |
+| long (372 tok) | 372 | 0.2 | 9.2 | 46× |
 
 ## Next steps (from roadmap)
 
-1. **KV-cache**: make generation O(n) instead of O(n²) — biggest single speedup
-2. Profiling and optimization deep-dive
+1. Profiling and optimization deep-dive
 
 ## Known issues
 

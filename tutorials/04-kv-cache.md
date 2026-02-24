@@ -1,0 +1,77 @@
+# 4. KV-Cache: from O(n²) to O(n) Decode
+
+## Where we are
+
+Pumpference can generate text, sample with temperature/top-k/top-p, and measure performance. The baseline decode speed on Apple M3 Pro CPU tells a bleak story: 1.3 tok/s on a 30-token prompt, dropping to 0.2 tok/s once the context grows to 372 tokens. That is not a hardware limitation — it is a fundamental algorithmic waste we are about to fix.
+
+## What we are adding and why
+
+The KV-cache is the single highest-impact optimisation in autoregressive generation. Without it, every decode step re-feeds the entire growing sequence through all 28 transformer layers. With it, each decode step processes exactly one token — the new one — while reusing the key/value tensors already computed for all past tokens.
+
+The concrete goal: make decode cost O(n) per step instead of O(n²), where n is the current sequence length.
+
+## Key decisions
+
+**Cache after RoPE, not before.**
+Rotary positional embeddings encode absolute position into each key vector. If you cache K before applying RoPE, you would need to re-apply RoPE on every decode step to every cached key, which both defeats the purpose and introduces a subtle bug: cached keys would get their positions rotated again and accumulate incorrect encodings. Caching after RoPE means the positional information is already baked in permanently — the cache entry for token at position 47 will always carry the rotation for position 47, regardless of when it gets attended to.
+
+**Cache at KV-head granularity, not Q-head granularity.**
+Qwen3-0.6B uses grouped-query attention (GQA): 16 query heads sharing 8 KV heads, with each KV head serving 2 query heads. The `repeat_interleave` expansion that inflates 8 KV heads to 16 happens in the forward pass, not in the cache. Caching at 8 heads instead of 16 cuts cache memory by half. For a 1000-token sequence: `28 layers × 2 (K+V) × 8 KV-heads × 128 head_dim × 2 bytes = ~114 MB` instead of ~228 MB.
+
+**Cache after QK-norm.**
+Qwen3 applies an RMSNorm to Q and K (QK-norm) before RoPE. Because RMSNorm is a purely local, position-independent operation, there is no mathematical reason to re-apply it to cached keys. Caching after QK-norm is consistent and correct.
+
+**Pre-slice the RoPE tables in the model, not inside `apply_rope`.**
+The original `apply_rope` sliced `cos[:seq_len]` internally, assuming positions always start at 0. With a cache, the new token at decode step `t` lives at position `P + t` (where P is the prompt length), not at position 0. Moving the slice to `Qwen3Model.forward()` — which has full knowledge of the cache's current length — means `apply_rope` can stay simple: it receives exactly the right position window and just broadcasts over batch and head dimensions.
+
+**All-false mask during decode.**
+The attention mask exists to prevent a token from attending to future tokens — a constraint that is mechanically enforced by the upper-triangular mask during prefill. During decode there is only one query token. There are no future tokens in the sequence. The mask for a `[1, kv_len]` attention matrix should be all-False: the single new token is allowed to attend to everything. Creating a `[1, kv_len]` all-False tensor is cheap and avoids any confusion from reusing the triangular mask.
+
+**`use_cache=False` as an escape hatch.**
+The `generate()` function accepts `use_cache=False` to fall back to the naive full-sequence recompute path. This exists solely for debugging and correctness comparison — it lets you run both paths on the same prompt and verify they produce identical tokens. In practice, the cached path should always be used.
+
+## The tricky parts
+
+| Issue | Symptom | Fix |
+|-------|---------|-----|
+| Caching K before RoPE | Text becomes incoherent after the first token; positional encodings accumulate incorrectly across steps | Call `kv_cache.update()` strictly after `apply_rope()` |
+| Wrong position offset on new token | New token attends to the wrong context; generation diverges from no-cache baseline | Read `kv_cache.seq_len` at the top of `Qwen3Model.forward()` *before* calling any layer, then slice `cos[past_len : past_len + q_len]` |
+| Using causal mask during decode | The single query is partially or fully masked; model only "sees" a subset of the context | During decode (`past_len > 0`), create a fresh all-False `[q_len, kv_len]` tensor on the correct device |
+| Expanding KV heads before caching | 2× memory usage for the cache | `kv_cache.update()` is called before `keys.repeat_interleave(...)` |
+| Stale cache across requests | Cached K/V from a previous generation leaks into the next one | `KVCache` is instantiated fresh at the start of each `generate()` call; `reset()` exists for manual control |
+| Float32 softmax not maintained | Long-sequence attention can overflow or produce NaN in bfloat16 | The `dtype=torch.float32` argument to `torch.softmax` is unchanged — it applies regardless of cache mode |
+
+## Results
+
+All runs on Apple M3 Pro, CPU, bfloat16, 100 tokens generated, 1 warmup pass.
+
+| Preset | Prompt tokens | Decode TPS (naive) | Decode TPS (KV-cache) | Speedup |
+|--------|---------------|--------------------|-----------------------|---------|
+| xs | 30 | 1.3 | 12.0 | 9.2× |
+| short | 115 | 0.6 | 12.6 | 21× |
+| medium | 218 | 0.3 | 8.5 | 28× |
+| long | 372 | 0.2 | 9.2 | 46× |
+
+The speedup grows with prompt length because the naive path scales as O(P²) per decode step — doubling the prompt roughly quadruples the per-token cost. The cached path's decode cost scales as O(P) per step, so the baseline penalty grows faster than the cache penalty, widening the gap.
+
+Decode TPS plateaus around 9–13 tok/s across prompt lengths (with some noise from the test system). This is the signature of the O(n) regime: cost grows slowly with sequence length rather than catastrophically. The small variation you see is the linear term: at 372 tokens, each decode step computes `Q @ K^T` over a [1 × 372] attention matrix, which is modestly more work than the [1 × 30] case at xs.
+
+Prefill speed is unchanged — that pass always processes all P tokens in parallel and benefits from no optimisation here.
+
+## Worth looking at in the code
+
+The position offset logic in `Qwen3Model.forward()` is the linchpin of the whole implementation. It is two lines, but they do everything:
+
+```python
+past_len = kv_cache.seq_len if kv_cache is not None else 0
+cos = self.cos[past_len : past_len + q_len]
+sin = self.sin[past_len : past_len + q_len]
+```
+
+`past_len` is 0 on the prefill pass (empty cache) and `P` on every decode step. Slicing the pre-computed RoPE table to `[past_len, past_len + q_len)` ensures the new token(s) get the correct positional encoding without any changes to `apply_rope` itself.
+
+The `KVCache.update()` method in `src/pumpference/model.py` is intentionally minimal: on the first call for a layer it stores the tensor as-is; on subsequent calls it `torch.cat`s along `dim=2` (the sequence dimension) and overwrites the stored entry. The returned tensor is the full accumulated K or V, ready to be attended to.
+
+## What's next
+
+Profiling to understand where the remaining ~83 ms/tok goes on CPU — the attention computation, the feed-forward network, and weight-loading overhead are all candidates.
