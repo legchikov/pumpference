@@ -6,13 +6,17 @@ Usage:
 """
 
 import argparse
+from dataclasses import replace
 
 import torch
 
+from .benchmark import _PROMPT_115, _PROMPT_30
 from .generate import generate
 from .model import QWEN3_0_6B_CONFIG, Qwen3Model, download_and_load_weights
 from .quantize import quantize_model
 from .tokenizer import download_tokenizer
+
+_AWQ_CALIBRATION_PROMPTS = [_PROMPT_30, _PROMPT_115]
 
 
 def main() -> None:
@@ -57,9 +61,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--quantize",
-        choices=["none", "int8", "int4"],
+        choices=["none", "int8", "int4", "awq_int8", "awq_int4"],
         default="none",
-        help="Weight-only quantization: none (default), int8, or int4",
+        help=(
+            "Weight-only quantization scheme. "
+            "int8/int4: plain RTN (no calibration). "
+            "awq_int8/awq_int4: AWQ calibration-based (better quality, slower setup)."
+        ),
+    )
+    parser.add_argument(
+        "--flash-attn",
+        action="store_true",
+        default=False,
+        help="Use tiled Flash Attention during prefill (O(n) memory vs O(n²)).",
     )
     args = parser.parse_args()
 
@@ -75,21 +89,30 @@ def main() -> None:
         device = torch.device(args.device)
     print(f"Using device: {device}")
 
+    # --- Tokenizer --------------------------------------------------------
+    tokenizer = download_tokenizer(repo_id=QWEN3_0_6B_CONFIG.repo_id)
+
     # --- Model ------------------------------------------------------------
     print("Loading model …")
-    model = Qwen3Model(QWEN3_0_6B_CONFIG)
-    download_and_load_weights(model, repo_id=QWEN3_0_6B_CONFIG.repo_id)
+    cfg = replace(QWEN3_0_6B_CONFIG, use_flash_attn=args.flash_attn)
+    model = Qwen3Model(cfg)
+    download_and_load_weights(model, repo_id=cfg.repo_id)
     if args.quantize != "none":
         print(f"Quantizing weights ({args.quantize}) …")
-        quantize_model(model, mode=args.quantize)
+        if args.quantize.startswith("awq"):
+            print("  Running AWQ calibration (collecting activation statistics) …")
+            cal_ids = [
+                torch.tensor([tokenizer.encode(p)])
+                for p in _AWQ_CALIBRATION_PROMPTS
+            ]
+            quantize_model(model, mode=args.quantize, calibration_ids=cal_ids)
+        else:
+            quantize_model(model, mode=args.quantize)
     model.to(device)
     model.eval()
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {total_params:,}")
-
-    # --- Tokenizer --------------------------------------------------------
-    tokenizer = download_tokenizer(repo_id=QWEN3_0_6B_CONFIG.repo_id)
 
     # --- Generate ---------------------------------------------------------
     print(f"\nPrompt: {args.prompt}\n")

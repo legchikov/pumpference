@@ -29,7 +29,9 @@ pumpference/
     ├── 03-benchmarking.md      # Tutorial 3: benchmarking harness (dev-log)
     ├── 04-kv-cache.md          # Tutorial 4: KV-cache (dev-log)
     ├── 05-profiling.md         # Tutorial 5: profiling decode step (dev-log)
-    └── 06-quantization.md      # Tutorial 6: weight-only quantization (dev-log)
+    ├── 06-quantization.md      # Tutorial 6: weight-only RTN quantization (dev-log)
+    ├── 06b-awq-quantization.md # Tutorial 6b: AWQ calibration-based quantization (dev-log)
+    └── 07-flash-attention.md   # Tutorial 7: Flash Attention — tiled O(n) attention (dev-log)
 ```
 
 ## Model architecture (Qwen3-0.6B)
@@ -38,14 +40,15 @@ Decoder-only transformer with the following components in `model.py`:
 
 | Class / Function | Purpose |
 |---|---|
-| `Qwen3Config` | Dataclass holding all hyperparameters (vocab_size, n_heads, n_layers, etc.) |
+| `Qwen3Config` | Dataclass holding all hyperparameters; includes `use_flash_attn: bool = False` |
 | `QWEN3_0_6B_CONFIG` | Singleton config instance for Qwen3-0.6B |
 | `KVCache` | Per-layer K/V cache: `update(layer_idx, k, v)` appends and returns accumulated tensors; `seq_len` property; `reset()` |
 | `RMSNorm` | Root Mean Square normalization (upcasts to float32 internally) |
 | `compute_rope_params()` | Pre-computes cos/sin tables for Rotary Positional Embeddings |
 | `apply_rope()` | Applies RoPE rotation to Q/K tensors (split-half); accepts pre-sliced cos/sin from caller |
 | `FeedForward` | SwiGLU FFN: silu(fc1(x)) * fc2(x) → fc3 (three linear layers) |
-| `GroupedQueryAttention` | GQA with 16 Q-heads, 8 KV-heads, optional QK-norm; accepts kv_cache + layer_idx |
+| `flash_attention()` | Tiled attention with online softmax; O(n) memory; is_causal + block_size args; auto-bypassed when q_len=1 |
+| `GroupedQueryAttention` | GQA with 16 Q-heads, 8 KV-heads, optional QK-norm; accepts kv_cache + layer_idx; use_flash_attn flag |
 | `TransformerBlock` | Pre-norm block: norm→attn→residual, norm→FFN→residual; threads kv_cache through |
 | `Qwen3Model` | Full model: embedding → 28 blocks → final norm → linear head; accepts kv_cache |
 | `load_weights_into_qwen()` | Maps HuggingFace weight names to our parameter names |
@@ -60,7 +63,11 @@ Decoder-only transformer with the following components in `model.py`:
 | `unpack_int4()` | Unpacks and dequantizes int4 back to float32 |
 | `Int8Linear` | Drop-in for `nn.Linear`; stores int8 weight + float32 scale; dequantizes on forward |
 | `Int4Linear` | Drop-in for `nn.Linear`; stores packed uint8 weight + float32 group scales; unpacks on forward |
-| `quantize_model()` | Replaces all `nn.Linear` in model with quantized variant in-place |
+| `quantize_model()` | Replaces all `nn.Linear` in model in-place; accepts `mode="int8"\|"int4"\|"awq_int8"\|"awq_int4"`; AWQ modes require `calibration_ids` |
+| `calibrate_awq()` | AWQ calibration: collects activation stats, grid-searches optimal per-channel scale α, absorbs scale into RMSNorm; model stays bfloat16 |
+| `_collect_norm_activation_stats()` | Hook-based: records mean \|activation\| at each block's norm1/norm2 output |
+| `_search_optimal_scale()` | Grid search over α ∈ [0,1]; minimises activation-weighted quant reconstruction error |
+| `_rtn_dequant_int8/int4()` | Quantize+dequantize round-trip helpers used in the grid search |
 
 **Profiling (`profile.py`):**
 
@@ -114,6 +121,6 @@ Tests in `test_model.py` use `scope="module"` fixtures (models loaded once). Fiv
 
 `test_sampling.py` — 2 unit tests for sampling strategies (no model load required).
 
-`test_quantize.py` — 11 tests for quantization: primitive round-trip, output shapes, structural (no nn.Linear remaining), memory reduction, argmax agreement (int8 ≥ 85%, int4 ≥ 70% on 30-token prompt), and generation runs without error.
+`test_quantize.py` — 18 tests for quantization: RTN primitive round-trip, output shapes, structural (no nn.Linear remaining), memory reduction, argmax agreement (RTN int8 ≥ 85%, int4 ≥ 70%), generation smoke tests; plus 7 AWQ tests: argmax quality (awq_int8 ≥ 88%, awq_int4 ≥ 75%), AWQ-vs-RTN comparison, generation smoke tests, convenience API, and error on missing calibration_ids.
 
 HF model must use `attn_implementation="eager"` for numerical consistency with manual attention.

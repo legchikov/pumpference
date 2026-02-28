@@ -8,6 +8,7 @@ The generated token sequences must be identical.
 
 import pytest
 import torch
+from dataclasses import replace
 from transformers import AutoModelForCausalLM
 
 from pumpference.generate import generate
@@ -199,3 +200,80 @@ def test_kv_cache_generation_matches_hf(our_model, hf_model, input_ids) -> None:
         f"  Ours (cached): {our_output[0].tolist()}\n"
         f"  HF:            {hf_output[0].tolist()}"
     )
+
+
+# ------------------------------------------------------------------
+# Flash Attention correctness tests
+# ------------------------------------------------------------------
+
+@torch.no_grad()
+def test_flash_attention_logits_match_eager(our_model, input_ids) -> None:
+    """
+    Flash attention must produce logits whose argmax matches eager at every
+    position.  This is the primary numerical correctness proof for the tiled
+    online-softmax algorithm: if the accumulators are updated correctly the
+    output tensor must be identical to the standard matmul/softmax path.
+
+    We compare argmax (not raw logit values) for the same reason as the HF
+    comparison: bfloat16 ↔ float32 round-trips in the tile loop can shift
+    logit magnitudes by a small epsilon, but should never change the argmax.
+    """
+    flash_cfg = replace(QWEN3_0_6B_CONFIG, use_flash_attn=True)
+
+    # Reuse the already-loaded weights by swapping the flash flag on each block.
+    # This avoids a second model load (expensive) while still testing the branch.
+    for block in our_model.trf_blocks:
+        block.att.use_flash_attn = True
+    try:
+        flash_logits = our_model(input_ids)
+    finally:
+        for block in our_model.trf_blocks:
+            block.att.use_flash_attn = False
+
+    eager_logits = our_model(input_ids)
+
+    assert torch.equal(flash_logits.argmax(dim=-1), eager_logits.argmax(dim=-1)), (
+        "Flash attention argmax differs from eager at one or more positions"
+    )
+
+
+@torch.no_grad()
+def test_flash_attention_logits_close_across_steps(our_model, input_ids) -> None:
+    """
+    Flash attention logits must stay close to eager for several generation steps.
+
+    Token-equality is not the right bar here: flash accumulates in float32
+    (higher precision), while eager casts softmax weights to bfloat16 before
+    the V matmul.  Both are correct; they differ by ≤1 ULP in bfloat16, which
+    can flip the argmax when two logits are extremely close in value.
+
+    This test verifies numerical consistency rather than bit-identity: at each
+    step we feed the SAME growing sequence to both paths, compare the last-
+    position logits, and assert the maximum absolute difference stays below 1.0
+    (the same threshold used in test_logits_argmax_matches_single_forward).
+    The sequence advances using eager's argmax to keep both paths on identical
+    inputs throughout.
+    """
+    STEPS = 5
+    tokens = input_ids.clone()
+
+    for step in range(STEPS):
+        # Flash pass on current sequence
+        for block in our_model.trf_blocks:
+            block.att.use_flash_attn = True
+        flash_logits = our_model(tokens)[:, -1].float()
+        for block in our_model.trf_blocks:
+            block.att.use_flash_attn = False
+
+        # Eager pass on the same sequence
+        eager_logits = our_model(tokens)[:, -1].float()
+
+        diff = (flash_logits - eager_logits).abs()
+        assert diff.max().item() < 1.0, (
+            f"Step {step} (q_len={tokens.shape[1]}): "
+            f"max logit diff {diff.max().item():.4f} exceeds threshold"
+        )
+
+        # Advance the sequence using eager's argmax (stable ground truth)
+        next_token = eager_logits.argmax(dim=-1, keepdim=True)
+        tokens = torch.cat([tokens, next_token], dim=1)

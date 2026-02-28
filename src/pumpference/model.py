@@ -38,6 +38,7 @@ class Qwen3Config:
     n_kv_groups: int = 8
     rope_base: float = 1_000_000.0
     dtype: torch.dtype = field(default=torch.bfloat16)
+    use_flash_attn: bool = False
 
 
 QWEN3_0_6B_CONFIG = Qwen3Config()
@@ -193,6 +194,106 @@ class FeedForward(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Flash Attention (pure PyTorch, tiled)
+# ---------------------------------------------------------------------------
+
+def flash_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    is_causal: bool = True,
+    block_size: int = 64,
+) -> torch.Tensor:
+    """
+    Flash Attention: tiled attention with online softmax.
+
+    Computes the same result as standard scaled dot-product attention but
+    uses O(n) memory instead of O(n²) by processing Q and KV in blocks and
+    accumulating the output without ever materialising the full N×N score
+    matrix.
+
+    The algorithm maintains three per-row running accumulators across the
+    inner KV loop:
+        m — running row-max of scores seen so far (for numerical stability)
+        l — running sum of exp(score − m) values (the softmax denominator)
+        O — running weighted sum of V vectors (the softmax numerator)
+
+    When a new KV tile arrives with a higher row-max, a correction factor
+    exp(m_old − m_new) rescales both l and O to the new baseline before
+    adding the new tile's contribution.
+
+    Args:
+        q:          [batch, heads, q_len, head_dim]
+        k:          [batch, heads, kv_len, head_dim]
+        v:          [batch, heads, kv_len, head_dim]
+        is_causal:  apply causal mask (token i cannot attend to j > i)
+        block_size: tokens per tile along both Q and KV dimensions
+
+    Returns:
+        [batch, heads, q_len, head_dim], same dtype as q
+    """
+    batch, heads, q_len, head_dim = q.shape
+    kv_len = k.shape[2]
+    scale = head_dim ** -0.5
+    orig_dtype = q.dtype
+
+    # Accumulate in float32 — exp() calls need the extra range; mirrors the
+    # existing eager path which also uses dtype=torch.float32 for softmax.
+    q, k, v = q.float(), k.float(), v.float()
+
+    output = torch.zeros(batch, heads, q_len, head_dim, dtype=torch.float32, device=q.device)
+
+    for q_start in range(0, q_len, block_size):
+        q_end   = min(q_start + block_size, q_len)
+        q_block = q[:, :, q_start:q_end, :]           # [B, H, Bq, head_dim]
+        Bq      = q_end - q_start
+
+        # Per-row running accumulators — reset fresh for each Q block.
+        # running_max starts at -inf so the first tile's max is accepted unconditionally.
+        acc_out = torch.zeros(batch, heads, Bq, head_dim, dtype=torch.float32, device=q.device)
+        acc_lse = torch.zeros(batch, heads, Bq, 1,        dtype=torch.float32, device=q.device)
+        running_max = torch.full((batch, heads, Bq, 1), float('-inf'), dtype=torch.float32, device=q.device)
+
+        for k_start in range(0, kv_len, block_size):
+            k_end = min(k_start + block_size, kv_len)
+
+            # Causal skip: if every key in this KV block is strictly in the
+            # future relative to every query in this Q block, all scores will
+            # be -inf and the tile contributes nothing — skip it entirely.
+            # KV blocks are in ascending order so we can break, not continue.
+            if is_causal and k_start > q_end - 1:
+                break
+
+            k_block = k[:, :, k_start:k_end, :]       # [B, H, Bk, head_dim]
+            v_block = v[:, :, k_start:k_end, :]       # [B, H, Bk, head_dim]
+
+            # Scaled dot-product scores for this tile: [B, H, Bq, Bk]
+            s = (q_block @ k_block.transpose(-2, -1)) * scale
+
+            # Causal mask within the tile: mask positions where key > query.
+            # Broadcasting: q_pos [Bq, 1] vs k_pos [1, Bk] → [Bq, Bk] mask.
+            if is_causal:
+                q_pos = torch.arange(q_start, q_end, device=q.device).unsqueeze(1)
+                k_pos = torch.arange(k_start, k_end, device=q.device).unsqueeze(0)
+                s = s.masked_fill(k_pos > q_pos, float('-inf'))
+
+            # Online softmax update ------------------------------------------
+            new_max    = torch.maximum(running_max, s.amax(dim=-1, keepdim=True))  # [B, H, Bq, 1]
+            correction = torch.exp(running_max - new_max)                           # [B, H, Bq, 1]
+            p          = torch.exp(s - new_max)                                     # [B, H, Bq, Bk]
+
+            # Rescale old accumulators to new max baseline, then add new tile.
+            acc_lse = correction * acc_lse + p.sum(dim=-1, keepdim=True)
+            acc_out = correction * acc_out + p @ v_block
+            running_max = new_max
+
+        # Divide by accumulated normalizer to get the final softmax-weighted sum.
+        output[:, :, q_start:q_end, :] = acc_out / acc_lse
+
+    return output.to(orig_dtype)
+
+
+# ---------------------------------------------------------------------------
 # Grouped-Query Attention (GQA)
 # ---------------------------------------------------------------------------
 
@@ -207,12 +308,14 @@ class GroupedQueryAttention(nn.Module):
         head_dim: int,
         qk_norm: bool = False,
         dtype: torch.dtype | None = None,
+        use_flash_attn: bool = False,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_groups = num_kv_groups
         self.head_dim = head_dim
         self.group_size = num_heads // num_kv_groups   # how many Q heads per KV head
+        self.use_flash_attn = use_flash_attn
 
         d_out = num_heads * head_dim
 
@@ -265,18 +368,24 @@ class GroupedQueryAttention(nn.Module):
         keys = keys.repeat_interleave(self.group_size, dim=1)
         values = values.repeat_interleave(self.group_size, dim=1)
 
-        # Scaled dot-product attention ----------------------------------------
-        # scores shape: [batch, num_heads, q_len, kv_len]
-        scores = queries @ keys.transpose(-2, -1)
-        scores = scores / self.head_dim ** 0.5
-        scores = scores.masked_fill(mask, -torch.inf)
-        weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(queries.dtype)
-
-        # Combine heads -------------------------------------------------------
-        # q_len may differ from kv_len during cached decode (q_len == 1).
+        # Attention -----------------------------------------------------------
         q_len = queries.shape[2]
         d_out = self.num_heads * self.head_dim
-        context = (weights @ values).transpose(1, 2).reshape(batch, q_len, d_out)
+
+        # Flash path: tiled O(n) memory — only worth it when q_len > 1.
+        # During KV-cached decode q_len == 1 so the scores matrix is already
+        # a single row; flash would add Python loop overhead with no benefit.
+        if self.use_flash_attn and q_len > 1:
+            context = flash_attention(queries, keys, values, is_causal=True)
+        else:
+            # Eager path: materialise the full [B, H, q_len, kv_len] scores matrix.
+            scores = queries @ keys.transpose(-2, -1)
+            scores = scores / self.head_dim ** 0.5
+            scores = scores.masked_fill(mask, -torch.inf)
+            weights = torch.softmax(scores, dim=-1, dtype=torch.float32).to(queries.dtype)
+            context = weights @ values
+
+        context = context.transpose(1, 2).reshape(batch, q_len, d_out)
         return self.out_proj(context)
 
 
@@ -296,6 +405,7 @@ class TransformerBlock(nn.Module):
             head_dim=cfg.head_dim,
             qk_norm=cfg.qk_norm,
             dtype=cfg.dtype,
+            use_flash_attn=cfg.use_flash_attn,
         )
         self.ff = FeedForward(cfg)
         self.norm1 = RMSNorm(cfg.emb_dim)

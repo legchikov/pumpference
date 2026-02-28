@@ -2,7 +2,7 @@
 
 ## Current state
 
-**Profiling and quantization are complete.** Tutorial 5 (profiling) and Tutorial 6 (quantization) are written and committed. 18 tests pass. The key finding: naive dequantize-on-forward quantization is 3–7× slower than bfloat16 on CPU because it materialises a full fp16 weight tensor before each matmul, adding bandwidth rather than removing it. The storage reduction is real but modest due to the large pre-allocated causal mask.
+**AWQ quantization is complete.** Tutorials 5 (profiling), 6 (RTN quantization), and 6b (AWQ quantization) are written. 25 tests pass. AWQ improves int4 argmax agreement from 80% → 83.3% and int8 from 90% → 93.3% (+3.3pp each) using a 2-sequence calibration dataset and 20-step grid search.
 
 ## What has been built
 
@@ -13,10 +13,11 @@
 - Sampling: temperature, top-k, top-p (nucleus) decoding
 - CLI entry point with device auto-detection (CUDA / MPS / CPU)
 - Test suite comparing single-forward logits argmax and multi-step greedy generation against HuggingFace
-- Benchmark harness (`benchmark.py`): prefill/decode TPS, TTFT, peak memory, per-token latency (p50/p90/p99), JSON output; supports `--quantize none|int8|int4`
+- Benchmark harness (`benchmark.py`): prefill/decode TPS, TTFT, peak memory, per-token latency (p50/p90/p99), JSON output; supports `--quantize none|int8|int4|awq_int8|awq_int4`
 - Benchmark preset aliases: `xs`≈30tok, `short`≈115tok, `medium`≈218tok, `long`≈373tok
 - **Profile harness** (`profile.py`): hook-based per-layer coarse timing + `torch.profiler` operator breakdown; `make profile`
 - **Weight-only quantization** (`quantize.py`): `Int8Linear` (W8A16, per-channel), `Int4Linear` (W4A16, group_size=128), `quantize_model(model, mode, group_size)`; exported from `__init__.py`
+- **AWQ calibration** (`quantize.py`): `calibrate_awq(model, calibration_ids, mode, group_size, n_grid)` — per-channel scale search (α grid), absorption into RMSNorm scales; `quantize_model(mode="awq_int8"|"awq_int4", calibration_ids=...)` convenience wrapper
 
 ## Baseline numbers (KV-cached decode, CPU bfloat16, 100 tokens generated)
 
@@ -44,15 +45,36 @@
 
 Key finding: dequantize-on-forward triples memory bandwidth (load int8 → write fp16 temp → read fp16 for matmul). Requires fused kernels for actual speedup.
 
+## AWQ quality results (30-token prompt, argmax agreement with bfloat16)
+
+| Mode | Argmax agreement | vs RTN |
+|------|-----------------|--------|
+| RTN int8 | 90.0% | — |
+| AWQ int8 | 93.3% | +3.3pp |
+| RTN int4 | 80.0% | — |
+| AWQ int4 | 83.3% | +3.3pp |
+
 ## Current work focus
 
-Completed tutorials 05 and 06. Ready for next step.
+Flash Attention (chapter 7) is complete. 20 tests pass.
+
+## What was added (Flash Attention)
+
+- `flash_attention(q, k, v, is_causal, block_size)` in `model.py`: tiled online-softmax, O(n) memory, float32 accumulation, causal tile skipping
+- `use_flash_attn: bool = False` field on `Qwen3Config`; wired into `GroupedQueryAttention` and `TransformerBlock`
+- Flash is auto-bypassed when `q_len == 1` (KV-cache decode step); eager used instead
+- `--flash-attn` flag added to `__main__.py` and `benchmark.py`; `dataclasses.replace()` pattern for safe config copy
+- `flash_attn: bool` field added to `BenchmarkResult`; shown in formatted output and JSON
+- Two new tests in `test_model.py`: argmax match for prompt (ground truth correctness); logit values close (< 1.0 diff) for 5 growing-sequence steps
+
+## Precision note
+
+Flash accumulates `p @ V` in float32 (higher precision than eager's bfloat16 V matmul). Both are mathematically correct; they differ by ≤1 ULP in bfloat16, which can flip argmax when two logits are extremely close. Token-equality tests are not appropriate for this reason.
 
 ## Next steps (from roadmap)
 
-1. Fused int8 kernels — bypass the fp16 temporary tensor to realize the bandwidth savings from quantization
-2. Calibration-based quantization — GPTQ or AWQ for better int4 quality
-3. Continuous batching / serving optimizations
+1. Speculative decoding — reduce total decode steps (chapter 8)
+2. Fused int8 kernels — bypass fp16 temporary for actual quantization speedup
 
 ## Known issues
 

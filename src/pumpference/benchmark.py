@@ -20,7 +20,7 @@ import platform
 import resource
 import subprocess
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean, quantiles
@@ -127,6 +127,9 @@ PRESET_ALIASES: dict[str, int] = {
     "long": 373,
 }
 
+# Short prompts used as AWQ calibration data.
+_CALIBRATION_PROMPTS = [_PROMPT_30, _PROMPT_115]
+
 
 # ---------------------------------------------------------------------------
 # Result dataclass
@@ -148,6 +151,7 @@ class BenchmarkResult:
     prefill_tps: float
     decode_tps: float
     peak_memory_mb: float
+    flash_attn: bool = False
     decode_step_latencies_ms: list[float] = field(default_factory=list)
     per_token_latency_ms: dict[str, float] = field(default_factory=dict)
 
@@ -198,6 +202,7 @@ def timed_generate(
     eos_token_id: int | None,
     device: torch.device,
     quantization: str = "none",
+    flash_attn: bool = False,
 ) -> tuple[torch.Tensor, BenchmarkResult]:
     """
     Run greedy generation with KV-cache while measuring prefill, decode, and memory.
@@ -282,6 +287,7 @@ def timed_generate(
         prefill_tps=round(prompt_len / (prefill_ms / 1000.0), 1) if prefill_ms > 0 else 0.0,
         decode_tps=round(decode_tokens / (decode_total_ms / 1000.0), 1) if decode_total_ms > 0 else 0.0,
         peak_memory_mb=round(peak_memory_mb, 1),
+        flash_attn=flash_attn,
         decode_step_latencies_ms=[round(x, 2) for x in decode_step_latencies],
         per_token_latency_ms=_latency_stats(decode_step_latencies),
     )
@@ -298,12 +304,14 @@ W = 51  # table width
 def format_results(result: BenchmarkResult) -> str:
     lat = result.per_token_latency_ms
     quant_label = result.quantization if result.quantization != "none" else "none (bfloat16)"
+    flash_label = "on" if result.flash_attn else "off"
     lines = [
         "═" * W,
         f"  pumpference benchmark — {result.model}",
         "═" * W,
         f"  Device:             {result.device} ({result.dtype})",
         f"  Quantization:       {quant_label}",
+        f"  Flash attention:    {flash_label}",
         f"  Prompt tokens:      {result.prompt_tokens}",
         f"  Generated tokens:   {result.generated_tokens}",
         "─" * W,
@@ -394,9 +402,19 @@ def main() -> None:
     parser.add_argument("--output-dir", type=str, default="benchmarks")
     parser.add_argument(
         "--quantize",
-        choices=["none", "int8", "int4"],
+        choices=["none", "int8", "int4", "awq_int8", "awq_int4"],
         default="none",
-        help="Weight-only quantization: none (default), int8, or int4",
+        help=(
+            "Weight-only quantization scheme. "
+            "int8/int4: plain RTN (no calibration). "
+            "awq_int8/awq_int4: AWQ calibration-based (better quality, slower setup)."
+        ),
+    )
+    parser.add_argument(
+        "--flash-attn",
+        action="store_true",
+        default=False,
+        help="Use tiled Flash Attention during prefill (O(n) memory vs O(n²)).",
     )
     args = parser.parse_args()
 
@@ -419,15 +437,23 @@ def main() -> None:
 
     # --- Load model + tokenizer ---
     print(f"Loading model on {device} …")
-    model = Qwen3Model(QWEN3_0_6B_CONFIG)
-    download_and_load_weights(model, repo_id=QWEN3_0_6B_CONFIG.repo_id)
+    cfg = replace(QWEN3_0_6B_CONFIG, use_flash_attn=args.flash_attn)
+    model = Qwen3Model(cfg)
+    download_and_load_weights(model, repo_id=cfg.repo_id)
+    tokenizer = download_tokenizer(repo_id=QWEN3_0_6B_CONFIG.repo_id)
     if args.quantize != "none":
         print(f"Quantizing weights ({args.quantize}) …")
-        quantize_model(model, mode=args.quantize)
+        if args.quantize.startswith("awq"):
+            print("  Running AWQ calibration (collecting activation statistics) …")
+            cal_ids = [
+                torch.tensor([tokenizer.encode(p)], device=device)
+                for p in _CALIBRATION_PROMPTS
+            ]
+            quantize_model(model, mode=args.quantize, calibration_ids=cal_ids)
+        else:
+            quantize_model(model, mode=args.quantize)
     model.to(device)
     model.eval()
-
-    tokenizer = download_tokenizer(repo_id=QWEN3_0_6B_CONFIG.repo_id)
     input_ids = torch.tensor(
         [tokenizer.encode(prompt)], device=device,
     )
@@ -447,6 +473,7 @@ def main() -> None:
         eos_token_id=tokenizer.eos_token_id,
         device=device,
         quantization=args.quantize,
+        flash_attn=args.flash_attn,
     )
 
     # --- Output ---

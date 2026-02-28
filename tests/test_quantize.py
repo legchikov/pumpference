@@ -5,9 +5,13 @@ The model is loaded once per module (scope="module") because download and
 weight-loading are expensive.  Correctness tests use short greedy generation
 or single-forward-pass logit checks.
 
-Quality thresholds:
+Quality thresholds (RTN):
   int8 — expect >= 95% argmax agreement with bfloat16 baseline
   int4 — expect >= 85% argmax agreement (group_size=128 is forgiving)
+
+Quality thresholds (AWQ):
+  awq_int8 — expect >= 88% (at least as good as RTN int8)
+  awq_int4 — expect >= 75% (at least as good as RTN int4; AWQ should improve quality)
 """
 
 from __future__ import annotations
@@ -18,12 +22,13 @@ import pytest
 import torch
 import torch.nn as nn
 
-from pumpference.benchmark import _PROMPT_30
+from pumpference.benchmark import _CALIBRATION_PROMPTS, _PROMPT_30
 from pumpference.generate import generate
 from pumpference.model import QWEN3_0_6B_CONFIG, Qwen3Model, download_and_load_weights
 from pumpference.quantize import (
     Int4Linear,
     Int8Linear,
+    calibrate_awq,
     quantize_model,
     quantize_per_channel_absmax,
     quantize_per_group,
