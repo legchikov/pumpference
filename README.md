@@ -8,26 +8,30 @@ Build a real inference engine, optimization by optimization, until you understan
 
 Starting from a naive 340-line PyTorch implementation and adding optimizations one at a time:
 
-| Chapter | Optimization | CPU tok/s | vs Naive | Memory |
-|---------|-------------|-----------|----------|--------|
-| 1 | Naive generation | 0.2 | — | 3,223 MB |
-| 4 | KV-cache | 12.0 | **60×** | +~114 MB (cache) |
-| 6 | Int8 quantization | 3.7* | — | 2,629 MB |
-| 6 | Int4 quantization | 1.8* | — | 2,348 MB |
+| Chapter | Optimization | CPU tok/s (decode) | vs Naive | Prefill tok/s |
+|---------|-------------|-------------------|----------|---------------|
+| 1 | Naive generation | 0.2 | — | — |
+| 4 | KV-cache | 12.0 | **60×** | ~96 |
+| 6 | Int8 quantization | 3.7† | — | — |
+| 6 | Int4 quantization | 1.8† | — | — |
+| 7 | Flash Attention | 12.0 | **60×** | **135–139** ↑1.4–1.9× |
 
-*Dequantize-on-forward is slower than fp16 — [Chapter 6 explains why](tutorials/06-quantization.md). Fused kernels are next.
+†Dequantize-on-forward is slower than fp16 — [Chapter 6 explains why](tutorials/06-quantization.md). Fused kernels are next.
+
+Flash Attention reduces prefill memory from O(n²) to O(n) and speeds up CPU prefill by 1.4–1.9× via causal-skip tile optimisation. Decode is unchanged (q_len=1 auto-falls back to eager).
 
 GPU baseline (KV-cached, bfloat16): **40 tok/s** on CUDA.
 
 ### Features
 
-- Full Qwen3-0.6B architecture in plain PyTorch (~340 lines, one file)
+- Full Qwen3-0.6B architecture in plain PyTorch (~580 lines, one file)
 - Greedy autoregressive generation verified token-for-token against HuggingFace `transformers`
 - KV-cache: O(n) decode instead of O(n²), 9–46× CPU speedup depending on context length
 - Sampling — temperature, top-k, top-p (nucleus), composable; `temperature=0` falls back to greedy
+- **Flash Attention** — tiled O(n) prefill; pure PyTorch online-softmax; 1.4–1.9× faster prefill on CPU; `--flash-attn` flag
 - Benchmark harness — prefill/decode TPS, TTFT, peak memory, per-token latency (p50/p90/p99)
 - Profile harness — per-module coarse timing + `torch.profiler` operator breakdown
-- Weight-only quantization — `Int8Linear` (W8A16) and `Int4Linear` (W4A16, group_size=128)
+- Weight-only quantization — `Int8Linear` (W8A16), `Int4Linear` (W4A16, group_size=128), AWQ calibration
 - CLI with device auto-detection (CUDA / MPS / CPU)
 
 ### Course Roadmap
@@ -57,7 +61,8 @@ graph LR
 | 4 | [KV-Cache: From O(n²) to O(n) Decode](tutorials/04-kv-cache.md) | ✅ |
 | 5 | [Profiling: Where Does the Time Go?](tutorials/05-profiling.md) | ✅ |
 | 6 | [Quantization: The Storage Win That Isn't a Speed Win (Yet)](tutorials/06-quantization.md) | ✅ |
-| 7 | FlashAttention | 🔜 |
+| 6b | [AWQ: Protecting the Channels That Matter](tutorials/06b-awq-quantization.md) | ✅ |
+| 7 | [Flash Attention: Tiling Away the N² Wall](tutorials/07-flash-attention.md) | ✅ |
 | 8 | Speculative Decoding | 🔜 |
 | 9 | Continuous Batching + PagedAttention | 🔜 |
 | 10 | Tensor Parallelism | 🔜 |
@@ -122,16 +127,23 @@ uv run python -m pumpference --prompt "Tell me a joke" --temperature 0.9 --top-p
 
 # Quantized inference (int8 / int4)
 uv run python -m pumpference --prompt "Tell me a joke" --quantize int8
+
+# Flash Attention (O(n) prefill memory, faster prefill on long contexts)
+uv run python -m pumpference --prompt "Tell me a joke" --flash-attn
 ```
 
 ### Benchmarking
 
 ```bash
-make bench                   # default: xs preset (~30 prompt tokens)
-make bench PRESET=short      # ~115 tokens
-make bench PRESET=medium     # ~218 tokens
-make bench PRESET=long       # ~373 tokens
-make bench PRESET=xs QUANTIZE=int8   # quantized benchmark
+make bench                        # default: xs preset (~30 prompt tokens)
+make bench PRESET=short           # ~115 tokens
+make bench PRESET=medium          # ~218 tokens
+make bench PRESET=long            # ~373 tokens
+make bench PRESET=xs QUANTIZE=int8  # quantized benchmark
+
+# Flash attention comparison (run both to see prefill speedup)
+uv run python -m pumpference.benchmark --preset long
+uv run python -m pumpference.benchmark --preset long --flash-attn
 ```
 
 Results are printed to stdout and saved as JSON under `benchmarks/`.
@@ -149,7 +161,7 @@ make profile PRESET=short
 uv run pytest
 ```
 
-18 tests: compares against HuggingFace `transformers` for correctness (logits, KV-cache, generation), 17 unit tests for sampling (no model required), 11 tests for quantization correctness and memory reduction.
+20 tests: 7 model tests (logits, KV-cache, generation, flash attention correctness) compared against HuggingFace `transformers`; sampling unit tests (no model required); quantization correctness, memory reduction, and AWQ quality tests.
 
 ### Contributing
 

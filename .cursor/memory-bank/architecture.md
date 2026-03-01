@@ -11,7 +11,7 @@ pumpference/
 │   └── pumpference/
 │       ├── __init__.py         # Public API: Qwen3Model, QWEN3_0_6B_CONFIG, generate, quantize_model
 │       ├── __main__.py         # CLI entry point (argparse, device detection, load, generate, --quantize)
-│       ├── model.py            # All architecture components + config + weight loading (~470 lines)
+│       ├── model.py            # All architecture components + config + weight loading (~580 lines, incl. flash_attention)
 │       ├── generate.py         # Greedy + sampling generation loop (~110 lines)
 │       ├── tokenizer.py        # Qwen3Tokenizer wrapper over HF tokenizers lib (~80 lines)
 │       ├── benchmark.py        # Benchmark harness: TPS, TTFT, memory, JSON output; --quantize flag
@@ -91,12 +91,13 @@ Generation loop (in `generate.py`): two-phase when `use_cache=True` (default): p
 
 ## Key design decisions
 
-1. **Single `model.py` file**: all architecture in one file (~340 lines) for readability — premature modularization was tried and reverted
+1. **Single `model.py` file**: all architecture in one file (~580 lines) for readability — premature modularization was tried and reverted
 2. **No bias terms**: all `nn.Linear` layers use `bias=False` (matches modern LLM convention)
 3. **bfloat16 by default**: matches the distribution format, avoids precision loss from casting
 4. **Pre-allocated buffers**: RoPE cos/sin tables and causal mask are `register_buffer(persistent=False)` — move with model to device, not saved in checkpoints
 5. **Weight tying**: output head shares weights with token embedding (no separate lm_head in Qwen3-0.6B)
 6. **`transformers` is dev-only**: the HF library is used only in tests for comparison, not at runtime
+7. **Flash attention is opt-in via config flag**: `Qwen3Config.use_flash_attn=False` by default; switched via `dataclasses.replace()` to avoid mutating the module-level singleton; auto-bypassed for `q_len=1` decode steps
 
 ## Critical implementation details
 
@@ -109,18 +110,21 @@ Generation loop (in `generate.py`): two-phase when `use_cache=True` (default): p
 - FFN weight mapping: fc1=gate_proj, fc2=up_proj, fc3=down_proj
 - Tokenizer handles special tokens via regex splitting before BPE encoding
 - EOS token is `<|im_end|>` (not `<|endoftext|>`)
+- Flash attention accumulates V-weighted sum in float32 (more precise than eager's bfloat16 V matmul); can produce different argmax than eager on borderline logit pairs — correct behaviour, not a bug
 
 ## Test architecture
 
-Tests in `test_model.py` use `scope="module"` fixtures (models loaded once). Five tests:
+Tests in `test_model.py` use `scope="module"` fixtures (models loaded once). Seven tests:
 1. `test_logits_argmax_matches_single_forward` — compares argmax at every position + checks max logit diff < 1.0
 2. `test_greedy_generation_matches_hf` — 20-token greedy generation, token-by-token equality
 3. `test_kv_cache_prefill_logits_match` — prefill with empty cache produces identical logits to uncached forward
 4. `test_kv_cache_generation_matches_no_cache` — cached generation produces bit-identical tokens to naive path
 5. `test_kv_cache_generation_matches_hf` — cached generation matches HuggingFace
+6. `test_flash_attention_logits_match_eager` — flash argmax identical to eager at every position (ground truth correctness proof)
+7. `test_flash_attention_logits_close_across_steps` — flash and eager logit values within 1.0 for 5 growing-sequence steps; flash computes in float32 (more precise than eager's bfloat16 V matmul), so token-equality is not the right bar
 
-`test_sampling.py` — 2 unit tests for sampling strategies (no model load required).
+`test_sampling.py` — unit tests for sampling strategies (no model load required).
 
-`test_quantize.py` — 18 tests for quantization: RTN primitive round-trip, output shapes, structural (no nn.Linear remaining), memory reduction, argmax agreement (RTN int8 ≥ 85%, int4 ≥ 70%), generation smoke tests; plus 7 AWQ tests: argmax quality (awq_int8 ≥ 88%, awq_int4 ≥ 75%), AWQ-vs-RTN comparison, generation smoke tests, convenience API, and error on missing calibration_ids.
+`test_quantize.py` — tests for quantization: RTN primitive round-trip, output shapes, structural (no nn.Linear remaining), memory reduction, argmax agreement (RTN int8 ≥ 85%, int4 ≥ 70%), generation smoke tests; plus AWQ tests: argmax quality (awq_int8 ≥ 88%, awq_int4 ≥ 75%), AWQ-vs-RTN comparison, generation smoke tests, convenience API, and error on missing calibration_ids.
 
-HF model must use `attn_implementation="eager"` for numerical consistency with manual attention.
+Total: 20 tests. HF model must use `attn_implementation="eager"` for numerical consistency with manual attention.
