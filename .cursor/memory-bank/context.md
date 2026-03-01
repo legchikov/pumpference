@@ -56,25 +56,34 @@ Key finding: dequantize-on-forward triples memory bandwidth (load int8 → write
 
 ## Current work focus
 
-Flash Attention (chapter 7) is complete. 20 tests pass.
+Speculative Decoding (chapter 8) is complete. 26 tests pass.
 
-## What was added (Flash Attention)
+## What was added (Speculative Decoding)
 
-- `flash_attention(q, k, v, is_causal, block_size)` in `model.py`: tiled online-softmax, O(n) memory, float32 accumulation, causal tile skipping
-- `use_flash_attn: bool = False` field on `Qwen3Config`; wired into `GroupedQueryAttention` and `TransformerBlock`
-- Flash is auto-bypassed when `q_len == 1` (KV-cache decode step); eager used instead
-- `--flash-attn` flag added to `__main__.py` and `benchmark.py`; `dataclasses.replace()` pattern for safe config copy
-- `flash_attn: bool` field added to `BenchmarkResult`; shown in formatted output and JSON
-- Two new tests in `test_model.py`: argmax match for prompt (ground truth correctness); logit values close (< 1.0 diff) for 5 growing-sequence steps
+- `QWEN3_1_7B_CONFIG` in `model.py`: config for the target model (emb_dim=2048, hidden_dim=6144, same n_layers/heads/vocab as 0.6B)
+- `KVCache.truncate(new_seq_len)` in `model.py`: slices cached tensors along dim=2; used for cache rollback on rejection
+- Causal mask fix in `Qwen3Model.forward()`: unified `mask = zeros(q_len, kv_len)` + `mask[:, past_len:] = causal_mask[:q_len, :q_len]` when `q_len > 1`; handles prefill, single-token decode, and multi-token speculative verification with one code path
+- Sharded weight loading in `download_and_load_weights`: tries single `model.safetensors` first, falls back to reading `model.safetensors.index.json` and downloading each shard (needed for Qwen3-1.7B's 2 shards)
+- `SpeculativeStats` dataclass and `speculative_generate()` in `generate.py`:
+  - Greedy acceptance (argmax comparison) and sampling (rejection sampling that provably preserves target distribution)
+  - KV-cache invariant: both caches have `seq_len = P + n_gen - 1`; draft loop feeds `last_token` as first input each round
+  - Full acceptance: feed d_K to draft to sync caches; bonus token from target position K
+  - Partial acceptance: truncate both caches to `cache_len_before + 1 + n_accepted`; corrected token fed in next round's draft loop
+- `_get_probs()` helper: converts logits to probability distribution respecting temperature/top-k/top-p (used for rejection sampling)
+- `--speculative` and `--draft-k` flags in `__main__.py` and `benchmark.py`
+- `speculative: bool`, `draft_k: int`, `acceptance_rate: float` fields in `BenchmarkResult`
+- `timed_speculative_generate()` in `benchmark.py`
+- 6 new tests in `test_speculative.py`: cache truncate (shape + values), multi-token mask correctness, greedy correctness (draft==target → 100% acceptance), sampling smoke, stats sanity
+- Tutorial `tutorials/08-speculative-decoding.md` in dev-log format
 
-## Precision note
+## Key bug found and fixed
 
-Flash accumulates `p @ V` in float32 (higher precision than eager's bfloat16 V matmul). Both are mathematically correct; they differ by ≤1 ULP in bfloat16, which can flip argmax when two logits are extremely close. Token-equality tests are not appropriate for this reason.
+Feeding first_token to draft in init then feeding last_token again in the draft loop caused double-counting at wrong positions → <100% acceptance even with draft==target. The fix: don't advance draft_cache past the prompt during init; the draft loop handles last_token itself.
 
 ## Next steps (from roadmap)
 
-1. Speculative decoding — reduce total decode steps (chapter 8)
-2. Fused int8 kernels — bypass fp16 temporary for actual quantization speedup
+1. Fused int8 kernels — bypass fp16 temporary for actual quantization speedup
+2. Chapter 9: Continuous Batching + Paged Attention
 
 ## Known issues
 

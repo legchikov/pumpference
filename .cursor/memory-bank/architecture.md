@@ -31,7 +31,8 @@ pumpference/
     ├── 05-profiling.md         # Tutorial 5: profiling decode step (dev-log)
     ├── 06-quantization.md      # Tutorial 6: weight-only RTN quantization (dev-log)
     ├── 06b-awq-quantization.md # Tutorial 6b: AWQ calibration-based quantization (dev-log)
-    └── 07-flash-attention.md   # Tutorial 7: Flash Attention — tiled O(n) attention (dev-log)
+    ├── 07-flash-attention.md   # Tutorial 7: Flash Attention — tiled O(n) attention (dev-log)
+    └── 08-speculative-decoding.md # Tutorial 8: Speculative Decoding — 0.6B draft → 1.7B target (dev-log)
 ```
 
 ## Model architecture (Qwen3-0.6B)
@@ -42,7 +43,8 @@ Decoder-only transformer with the following components in `model.py`:
 |---|---|
 | `Qwen3Config` | Dataclass holding all hyperparameters; includes `use_flash_attn: bool = False` |
 | `QWEN3_0_6B_CONFIG` | Singleton config instance for Qwen3-0.6B |
-| `KVCache` | Per-layer K/V cache: `update(layer_idx, k, v)` appends and returns accumulated tensors; `seq_len` property; `reset()` |
+| `QWEN3_1_7B_CONFIG` | Config for Qwen3-1.7B (emb_dim=2048, hidden_dim=6144; same n_layers/heads/vocab) |
+| `KVCache` | Per-layer K/V cache: `update(layer_idx, k, v)` appends; `truncate(new_seq_len)` slices for cache rollback; `seq_len` property; `reset()` |
 | `RMSNorm` | Root Mean Square normalization (upcasts to float32 internally) |
 | `compute_rope_params()` | Pre-computes cos/sin tables for Rotary Positional Embeddings |
 | `apply_rope()` | Applies RoPE rotation to Q/K tensors (split-half); accepts pre-sliced cos/sin from caller |
@@ -89,14 +91,17 @@ input_ids [batch, seq_len]
 
 Generation loop (in `generate.py`): two-phase when `use_cache=True` (default): phase 1 prefills the full prompt and fills the `KVCache`, phase 2 feeds one token per step. `use_cache=False` retains the original full-sequence recompute path. `sample_next_token` selects the next token — greedy argmax when `temperature=0`, otherwise applies temperature scaling → optional top-k filter → optional top-p (nucleus) filter → `torch.multinomial`.
 
+`speculative_generate()` (in `generate.py`): draft model proposes K tokens per round; target verifies all K+1 (last accepted + K drafts) in one forward pass. Supports greedy (argmax match) and sampling (rejection sampling). `SpeculativeStats` dataclass tracks acceptance rate and tokens/round. `_get_probs()` helper converts logits to distributions for rejection sampling.
+
 ## Key design decisions
 
 1. **Single `model.py` file**: all architecture in one file (~580 lines) for readability — premature modularization was tried and reverted
 2. **No bias terms**: all `nn.Linear` layers use `bias=False` (matches modern LLM convention)
 3. **bfloat16 by default**: matches the distribution format, avoids precision loss from casting
 4. **Pre-allocated buffers**: RoPE cos/sin tables and causal mask are `register_buffer(persistent=False)` — move with model to device, not saved in checkpoints
-5. **Weight tying**: output head shares weights with token embedding (no separate lm_head in Qwen3-0.6B)
+5. **Weight tying**: output head shares weights with token embedding (no separate lm_head in Qwen3-0.6B and Qwen3-1.7B)
 6. **`transformers` is dev-only**: the HF library is used only in tests for comparison, not at runtime
+7. **Sharded safetensors**: `download_and_load_weights` tries single `model.safetensors`, falls back to reading `model.safetensors.index.json` for multi-shard models (Qwen3-1.7B has 2 shards)
 7. **Flash attention is opt-in via config flag**: `Qwen3Config.use_flash_attn=False` by default; switched via `dataclasses.replace()` to avoid mutating the module-level singleton; auto-bypassed for `q_len=1` decode steps
 
 ## Critical implementation details
@@ -105,6 +110,7 @@ Generation loop (in `generate.py`): two-phase when `use_cache=True` (default): p
 - RoPE uses split-half convention (not interleaved) with theta_base=1,000,000
 - Softmax in attention is computed in float32 to prevent overflow
 - Causal mask uses `-torch.inf` (not `-1e9`) for exact zeros after softmax
+- Causal mask is unified: `mask = zeros(q_len, kv_len)`, then `mask[:, past_len:] = causal_mask[:q_len, :q_len]` when `q_len > 1`; handles prefill, single-token decode, and multi-token speculative verification
 - QK normalization (RMSNorm on Q and K) applied after projection, before RoPE
 - KV heads expanded via `repeat_interleave` after RoPE application
 - FFN weight mapping: fc1=gate_proj, fc2=up_proj, fc3=down_proj
@@ -127,4 +133,6 @@ Tests in `test_model.py` use `scope="module"` fixtures (models loaded once). Sev
 
 `test_quantize.py` — tests for quantization: RTN primitive round-trip, output shapes, structural (no nn.Linear remaining), memory reduction, argmax agreement (RTN int8 ≥ 85%, int4 ≥ 70%), generation smoke tests; plus AWQ tests: argmax quality (awq_int8 ≥ 88%, awq_int4 ≥ 75%), AWQ-vs-RTN comparison, generation smoke tests, convenience API, and error on missing calibration_ids.
 
-Total: 20 tests. HF model must use `attn_implementation="eager"` for numerical consistency with manual attention.
+`test_speculative.py` — 6 tests: `KVCache.truncate` shape/value correctness, multi-token decode mask match (sequential vs batch, validates the causal-mask fix), speculative greedy correctness (draft==target → 100% acceptance + identical output to `generate()`), sampling smoke, stats sanity.
+
+Total: 26 tests. HF model must use `attn_implementation="eager"` for numerical consistency with manual attention.

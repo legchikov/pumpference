@@ -43,6 +43,12 @@ class Qwen3Config:
 
 QWEN3_0_6B_CONFIG = Qwen3Config()
 
+QWEN3_1_7B_CONFIG = Qwen3Config(
+    repo_id="Qwen/Qwen3-1.7B",
+    emb_dim=2048,
+    hidden_dim=6144,
+)
+
 
 # ---------------------------------------------------------------------------
 # KV-Cache
@@ -96,6 +102,19 @@ class KVCache:
         else:
             self._cache.append((keys, values))
         return keys, values
+
+    def truncate(self, new_seq_len: int) -> None:
+        """
+        Trim all cached K/V tensors to *new_seq_len* tokens along dim=2.
+
+        Called during speculative decoding when draft tokens are rejected:
+        the cache is rolled back to the last accepted position so the next
+        speculation round starts from a consistent state.
+        """
+        self._cache = [
+            (k[:, :, :new_seq_len, :], v[:, :, :new_seq_len, :])
+            for k, v in self._cache
+        ]
 
     def reset(self) -> None:
         """Clear all cached tensors (call before a new generation request)."""
@@ -493,14 +512,18 @@ class Qwen3Model(nn.Module):
         sin = self.sin[past_len : past_len + q_len]
 
         # Build the attention mask for scores of shape [q_len, kv_len].
+        # Three cases all handled uniformly:
+        #   1. Prefill (past_len=0, q_len=P): standard causal mask.
+        #   2. KV-cached single-token decode (past_len=P, q_len=1): all-False,
+        #      the single query attends to the full cached context.
+        #   3. Speculative verification (past_len=P, q_len=K+1): the right
+        #      past_len columns are all-False (past is always visible), and the
+        #      remaining q_len×q_len block gets a causal mask so token i cannot
+        #      attend to draft tokens j > i.
         kv_len = past_len + q_len
-        if past_len == 0:
-            # Standard causal mask: token i cannot attend to token j > i.
-            mask = self.causal_mask[:q_len, :kv_len]
-        else:
-            # Single new token during decode: it can attend to all past tokens
-            # plus itself — no future tokens exist to block, so mask is all-False.
-            mask = torch.zeros(q_len, kv_len, dtype=torch.bool, device=x.device)
+        mask = torch.zeros(q_len, kv_len, dtype=torch.bool, device=x.device)
+        if q_len > 1:
+            mask[:, past_len:] = self.causal_mask[:q_len, :q_len]
 
         for layer_idx, block in enumerate(self.trf_blocks):
             x = block(x, mask, cos, sin, kv_cache=kv_cache, layer_idx=layer_idx)
@@ -563,15 +586,51 @@ def download_and_load_weights(
     model: Qwen3Model,
     repo_id: str = "Qwen/Qwen3-0.6B",
 ) -> None:
-    """Download weights from HuggingFace Hub and load them into the model."""
+    """
+    Download weights from HuggingFace Hub and load them into the model.
+
+    Handles both single-file models (e.g. Qwen3-0.6B, model.safetensors)
+    and sharded models (e.g. Qwen3-1.7B, model-00001-of-NNNNN.safetensors).
+    Shard filenames are discovered by reading model.safetensors.index.json.
+    """
+    import json
+
     local_dir = Path(repo_id).parts[-1]
 
-    # Qwen3-0.6B has a single safetensors file
-    weights_path = hf_hub_download(
+    # Try a single-file model first.
+    try:
+        weights_path = hf_hub_download(
+            repo_id=repo_id,
+            filename="model.safetensors",
+            local_dir=local_dir,
+        )
+        weights = load_file(weights_path)
+        load_weights_into_qwen(model, weights)
+        del weights
+        return
+    except Exception:
+        pass
+
+    # Fall back to sharded model: read the index to discover shard filenames.
+    index_path = hf_hub_download(
         repo_id=repo_id,
-        filename="model.safetensors",
+        filename="model.safetensors.index.json",
         local_dir=local_dir,
     )
-    weights = load_file(weights_path)
-    load_weights_into_qwen(model, weights)
-    del weights
+    with open(index_path) as f:
+        index = json.load(f)
+
+    # weight_map maps param-name → shard filename; collect unique shards.
+    shard_files: list[str] = sorted(set(index["weight_map"].values()))
+
+    merged: dict[str, object] = {}
+    for shard_filename in shard_files:
+        shard_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=shard_filename,
+            local_dir=local_dir,
+        )
+        merged.update(load_file(shard_path))
+
+    load_weights_into_qwen(model, merged)
+    del merged

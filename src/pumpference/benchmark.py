@@ -27,7 +27,14 @@ from statistics import mean, quantiles
 
 import torch
 
-from .model import QWEN3_0_6B_CONFIG, KVCache, Qwen3Model, download_and_load_weights
+from .generate import speculative_generate
+from .model import (
+    QWEN3_0_6B_CONFIG,
+    QWEN3_1_7B_CONFIG,
+    KVCache,
+    Qwen3Model,
+    download_and_load_weights,
+)
 from .quantize import quantize_model
 from .tokenizer import download_tokenizer
 
@@ -152,6 +159,9 @@ class BenchmarkResult:
     decode_tps: float
     peak_memory_mb: float
     flash_attn: bool = False
+    speculative: bool = False
+    draft_k: int = 0
+    acceptance_rate: float = 0.0
     decode_step_latencies_ms: list[float] = field(default_factory=list)
     per_token_latency_ms: dict[str, float] = field(default_factory=dict)
 
@@ -296,6 +306,102 @@ def timed_generate(
 
 
 # ---------------------------------------------------------------------------
+# Instrumented speculative generation
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def timed_speculative_generate(
+    target_model: Qwen3Model,
+    draft_model: Qwen3Model,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+    eos_token_id: int | None,
+    device: torch.device,
+    draft_k: int = 5,
+    flash_attn: bool = False,
+) -> tuple[torch.Tensor, BenchmarkResult]:
+    """
+    Run speculative generation while measuring prefill and decode timing.
+
+    Prefill is measured by timing the first target-model forward pass (the
+    full prompt).  Decode timing covers all speculation rounds.  The per-round
+    time is treated as a single latency entry in decode_step_latencies_ms so
+    the existing latency-statistics helpers can be reused unchanged.
+    """
+    target_model.eval()
+    draft_model.eval()
+    prompt_len = input_ids.shape[1]
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    # --- Prefill timing (target model only; mirrors timed_generate) ---
+    _sync(device)
+    t_prefill_start = time.perf_counter()
+
+    from .generate import KVCache as _KVCache
+    # Run a single target prefill pass to measure TTFT.
+    _tmp_cache = _KVCache()
+    target_model(input_ids, kv_cache=_tmp_cache)
+
+    _sync(device)
+    t_prefill_end = time.perf_counter()
+    prefill_ms = (t_prefill_end - t_prefill_start) * 1000.0
+
+    # --- Full speculative generation (includes re-prefill internally) ---
+    _sync(device)
+    t_decode_start = time.perf_counter()
+
+    tokens, spec_stats = speculative_generate(
+        target_model=target_model,
+        draft_model=draft_model,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        num_speculative_tokens=draft_k,
+        eos_token_id=eos_token_id,
+    )
+
+    _sync(device)
+    t_decode_end = time.perf_counter()
+    decode_total_ms = (t_decode_end - t_decode_start) * 1000.0
+
+    generated_tokens = tokens.shape[1] - prompt_len
+
+    if device.type == "cuda":
+        peak_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
+    else:
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if platform.system() == "Darwin":
+            peak_memory_mb = rss / (1024 * 1024)
+        else:
+            peak_memory_mb = rss / 1024
+
+    decode_tokens = max(generated_tokens - 1, 0)
+    result = BenchmarkResult(
+        timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+        git_commit=_git_commit(),
+        device=str(device),
+        dtype=str(QWEN3_0_6B_CONFIG.dtype).replace("torch.", ""),
+        quantization="none",
+        model=f"{QWEN3_0_6B_CONFIG.repo_id.split('/')[-1]}→{QWEN3_1_7B_CONFIG.repo_id.split('/')[-1]}",
+        prompt_tokens=prompt_len,
+        generated_tokens=generated_tokens,
+        prefill_ms=round(prefill_ms, 2),
+        decode_total_ms=round(decode_total_ms, 2),
+        ttft_ms=round(prefill_ms, 2),
+        prefill_tps=round(prompt_len / (prefill_ms / 1000.0), 1) if prefill_ms > 0 else 0.0,
+        decode_tps=round(decode_tokens / (decode_total_ms / 1000.0), 1) if decode_total_ms > 0 else 0.0,
+        peak_memory_mb=round(peak_memory_mb, 1),
+        flash_attn=flash_attn,
+        speculative=True,
+        draft_k=draft_k,
+        acceptance_rate=spec_stats.acceptance_rate,
+    )
+
+    return tokens, result
+
+
+# ---------------------------------------------------------------------------
 # Output formatting
 # ---------------------------------------------------------------------------
 
@@ -305,6 +411,7 @@ def format_results(result: BenchmarkResult) -> str:
     lat = result.per_token_latency_ms
     quant_label = result.quantization if result.quantization != "none" else "none (bfloat16)"
     flash_label = "on" if result.flash_attn else "off"
+    spec_label = f"on (K={result.draft_k}, acc={result.acceptance_rate:.1%})" if result.speculative else "off"
     lines = [
         "═" * W,
         f"  pumpference benchmark — {result.model}",
@@ -312,6 +419,7 @@ def format_results(result: BenchmarkResult) -> str:
         f"  Device:             {result.device} ({result.dtype})",
         f"  Quantization:       {quant_label}",
         f"  Flash attention:    {flash_label}",
+        f"  Speculative:        {spec_label}",
         f"  Prompt tokens:      {result.prompt_tokens}",
         f"  Generated tokens:   {result.generated_tokens}",
         "─" * W,
@@ -416,6 +524,22 @@ def main() -> None:
         default=False,
         help="Use tiled Flash Attention during prefill (O(n) memory vs O(n²)).",
     )
+    parser.add_argument(
+        "--speculative",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable speculative decoding (Qwen3-0.6B draft → Qwen3-1.7B target). "
+            "Requires downloading the 1.7B model (~4 GB) on first run."
+        ),
+    )
+    parser.add_argument(
+        "--draft-k",
+        type=int,
+        default=5,
+        metavar="K",
+        help="Draft tokens per speculation round (default: 5). Ignored unless --speculative.",
+    )
     args = parser.parse_args()
 
     # Resolve prompt — named alias → token count → prompt text
@@ -435,28 +559,42 @@ def main() -> None:
     else:
         device = torch.device(args.device)
 
-    # --- Load model + tokenizer ---
-    print(f"Loading model on {device} …")
-    cfg = replace(QWEN3_0_6B_CONFIG, use_flash_attn=args.flash_attn)
-    model = Qwen3Model(cfg)
-    download_and_load_weights(model, repo_id=cfg.repo_id)
+    # --- Load model(s) + tokenizer ---
     tokenizer = download_tokenizer(repo_id=QWEN3_0_6B_CONFIG.repo_id)
-    if args.quantize != "none":
-        print(f"Quantizing weights ({args.quantize}) …")
-        if args.quantize.startswith("awq"):
-            print("  Running AWQ calibration (collecting activation statistics) …")
-            cal_ids = [
-                torch.tensor([tokenizer.encode(p)], device=device)
-                for p in _CALIBRATION_PROMPTS
-            ]
-            quantize_model(model, mode=args.quantize, calibration_ids=cal_ids)
-        else:
-            quantize_model(model, mode=args.quantize)
-    model.to(device)
-    model.eval()
-    input_ids = torch.tensor(
-        [tokenizer.encode(prompt)], device=device,
-    )
+    input_ids = torch.tensor([tokenizer.encode(prompt)], device=device)
+
+    if args.speculative:
+        print(f"Loading draft model (Qwen3-0.6B) on {device} …")
+        draft_cfg = replace(QWEN3_0_6B_CONFIG, use_flash_attn=args.flash_attn)
+        draft_model = Qwen3Model(draft_cfg)
+        download_and_load_weights(draft_model, repo_id=draft_cfg.repo_id)
+        draft_model.to(device)
+        draft_model.eval()
+
+        print("Loading target model (Qwen3-1.7B) …")
+        target_cfg = replace(QWEN3_1_7B_CONFIG, use_flash_attn=args.flash_attn)
+        model = Qwen3Model(target_cfg)
+        download_and_load_weights(model, repo_id=target_cfg.repo_id)
+        model.to(device)
+        model.eval()
+    else:
+        print(f"Loading model on {device} …")
+        cfg = replace(QWEN3_0_6B_CONFIG, use_flash_attn=args.flash_attn)
+        model = Qwen3Model(cfg)
+        download_and_load_weights(model, repo_id=cfg.repo_id)
+        if args.quantize != "none":
+            print(f"Quantizing weights ({args.quantize}) …")
+            if args.quantize.startswith("awq"):
+                print("  Running AWQ calibration (collecting activation statistics) …")
+                cal_ids = [
+                    torch.tensor([tokenizer.encode(p)], device=device)
+                    for p in _CALIBRATION_PROMPTS
+                ]
+                quantize_model(model, mode=args.quantize, calibration_ids=cal_ids)
+            else:
+                quantize_model(model, mode=args.quantize)
+        model.to(device)
+        model.eval()
 
     # --- Warmup ---
     for i in range(args.warmup):
@@ -466,15 +604,27 @@ def main() -> None:
 
     # --- Benchmark ---
     print("Running benchmark …")
-    _, result = timed_generate(
-        model,
-        input_ids,
-        max_new_tokens=args.max_tokens,
-        eos_token_id=tokenizer.eos_token_id,
-        device=device,
-        quantization=args.quantize,
-        flash_attn=args.flash_attn,
-    )
+    if args.speculative:
+        _, result = timed_speculative_generate(
+            target_model=model,
+            draft_model=draft_model,
+            input_ids=input_ids,
+            max_new_tokens=args.max_tokens,
+            eos_token_id=tokenizer.eos_token_id,
+            device=device,
+            draft_k=args.draft_k,
+            flash_attn=args.flash_attn,
+        )
+    else:
+        _, result = timed_generate(
+            model,
+            input_ids,
+            max_new_tokens=args.max_tokens,
+            eos_token_id=tokenizer.eos_token_id,
+            device=device,
+            quantization=args.quantize,
+            flash_attn=args.flash_attn,
+        )
 
     # --- Output ---
     print()
